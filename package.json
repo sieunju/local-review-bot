@@ -1,0 +1,22 @@
+{
+  "name": "local-review-bot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "ts-node src/pr-reviewer.ts",
+    "build": "tsc",
+    "start": "node dist/pr-reviewer.js",
+    "review:once": "ts-node src/pr-reviewer.ts --once",
+    "db:reset": "rm -f pr-reviewer.db"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.9.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}

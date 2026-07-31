@@ -61,9 +61,15 @@ function markReviewed(prNumber: number): void {
   ).run(prNumber, new Date().toISOString());
 }
 
+function readIfExists(fileName: string): string {
+  const filePath = path.join(process.cwd(), fileName);
+  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : "";
+}
+
 function loadReviewGuide(): string {
-  const guidePath = path.join(process.cwd(), "CLAUDE.md");
-  return fs.existsSync(guidePath) ? fs.readFileSync(guidePath, "utf-8") : "";
+  const guide = readIfExists("CLAUDE.md");
+  const reference = readIfExists("REFERENCE.md");
+  return reference ? `${guide}\n\n---\n\n${reference}` : guide;
 }
 
 async function generateReview(diff: string): Promise<string> {

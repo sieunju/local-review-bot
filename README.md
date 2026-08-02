@@ -55,6 +55,12 @@ npm run build && npm start   # 빌드 후 실행
 
 [CLAUDE.md](CLAUDE.md) 내용이 그대로 리뷰 모델의 시스템 프롬프트에 들어갑니다. 팀 리뷰 기준을 바꾸려면 코드가 아니라 이 파일만 수정하면 됩니다.
 
+[REFERENCE.md](REFERENCE.md)가 있으면 `CLAUDE.md` 뒤에 이어붙여서 같이 시스템 프롬프트에 포함됩니다. 로컬 모델이 스스로 찾아볼 수 없는 라이브러리 지식(OkHttp/Retrofit, RxJava-Flow, Lifecycle, Room, MVVM/MVI, 모듈화 등)을 미리 주입하는 용도입니다. 없어도 정상 동작합니다.
+
+## 인라인 리뷰 코멘트
+
+리뷰는 PR 전체에 대한 코멘트 하나가 아니라, Ollama가 `{summary, comments: [{file, line, body}]}` 형태의 JSON으로 응답하면 실제 diff의 해당 줄에 인라인 코멘트로 등록됩니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
+
 ## DB 초기화
 
 이미 리뷰한 PR은 `pr-reviewer.db`(SQLite)에 기록되어 중복 리뷰하지 않습니다. 초기화하려면:

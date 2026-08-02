@@ -2,7 +2,7 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
-import { createGitProvider } from "./providers";
+import { createGitProvider, InlineComment } from "./providers";
 
 const DEFAULT_URLS: Record<string, string> = {
   gitea: "http://localhost:3000",
@@ -72,7 +72,43 @@ function loadReviewGuide(): string {
   return reference ? `${guide}\n\n---\n\n${reference}` : guide;
 }
 
-async function generateReview(diff: string): Promise<string> {
+interface ParsedReview {
+  summary: string;
+  comments: InlineComment[];
+}
+
+const REVIEW_JSON_INSTRUCTIONS = `
+Respond with ONLY valid JSON (no markdown fences, no extra text) in this exact shape:
+{
+  "summary": "one-line overall summary",
+  "comments": [
+    { "file": "path/to/File.kt", "line": 42, "body": "review comment for this line" }
+  ]
+}
+"line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Omit comments you are not confident about the line number for.
+`;
+
+function parseReview(raw: string): ParsedReview {
+  const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
+  try {
+    const parsed = JSON.parse(jsonText) as {
+      summary?: string;
+      comments?: Array<{ file: string; line: number; body: string }>;
+    };
+    return {
+      summary: parsed.summary ?? "",
+      comments: (parsed.comments ?? []).map((c) => ({
+        path: c.file,
+        line: c.line,
+        body: c.body,
+      })),
+    };
+  } catch {
+    return { summary: raw, comments: [] };
+  }
+}
+
+async function generateReview(diff: string): Promise<ParsedReview> {
   const guide = loadReviewGuide();
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: "POST",
@@ -83,7 +119,7 @@ async function generateReview(diff: string): Promise<string> {
       messages: [
         {
           role: "system",
-          content: `You are an Android code reviewer. Follow this team's review guide:\n\n${guide}`,
+          content: `You are an Android code reviewer. Follow this team's review guide:\n\n${guide}\n\n${REVIEW_JSON_INSTRUCTIONS}`,
         },
         {
           role: "user",
@@ -96,7 +132,7 @@ async function generateReview(diff: string): Promise<string> {
     throw new Error(`Ollama API error: ${res.status}`);
   }
   const data = (await res.json()) as { message: { content: string } };
-  return data.message.content;
+  return parseReview(data.message.content);
 }
 
 async function reviewOpenPullRequests(): Promise<void> {
@@ -117,9 +153,12 @@ async function reviewOpenPullRequests(): Promise<void> {
 
     console.log(`🔍 PR #${pr.number} 리뷰 시작: "${pr.title}"`);
     const review = await generateReview(diff);
-    await gitProvider.postComment(pr.number, review);
+    const refs = await gitProvider.fetchDiffRefs(pr.number);
+    await gitProvider.postReview(pr.number, refs, review.summary, review.comments);
     markReviewed(pr.number);
-    console.log(`✅ PR #${pr.number}에 리뷰 댓글 추가됨`);
+    console.log(
+      `✅ PR #${pr.number}에 리뷰 등록됨 (인라인 코멘트 ${review.comments.length}개)`
+    );
   }
 }
 

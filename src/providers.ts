@@ -3,10 +3,28 @@ export interface PullRequest {
   title: string;
 }
 
+export interface InlineComment {
+  path: string;
+  line: number;
+  body: string;
+}
+
+export interface DiffRefs {
+  headSha: string;
+  baseSha?: string;
+  startSha?: string;
+}
+
 export interface GitProvider {
   fetchOpenPullRequests(): Promise<PullRequest[]>;
   fetchDiff(prNumber: number): Promise<string>;
-  postComment(prNumber: number, body: string): Promise<void>;
+  fetchDiffRefs(prNumber: number): Promise<DiffRefs>;
+  postReview(
+    prNumber: number,
+    refs: DiffRefs,
+    summary: string,
+    comments: InlineComment[]
+  ): Promise<void>;
 }
 
 interface ProviderConfig {
@@ -47,13 +65,35 @@ class GiteaProvider implements GitProvider {
     return res.text();
   }
 
-  async postComment(prNumber: number, body: string): Promise<void> {
+  async fetchDiffRefs(prNumber: number): Promise<DiffRefs> {
+    const res = await this.request(
+      `/repos/${this.config.owner}/${this.config.repo}/pulls/${prNumber}`
+    );
+    const data: { head: { sha: string } } = await res.json();
+    return { headSha: data.head.sha };
+  }
+
+  async postReview(
+    prNumber: number,
+    refs: DiffRefs,
+    summary: string,
+    comments: InlineComment[]
+  ): Promise<void> {
     await this.request(
-      `/repos/${this.config.owner}/${this.config.repo}/issues/${prNumber}/comments`,
+      `/repos/${this.config.owner}/${this.config.repo}/pulls/${prNumber}/reviews`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({
+          commit_id: refs.headSha,
+          event: "COMMENT",
+          body: summary,
+          comments: comments.map((c) => ({
+            path: c.path,
+            new_position: c.line,
+            body: c.body,
+          })),
+        }),
       }
     );
   }
@@ -92,13 +132,35 @@ class GithubProvider implements GitProvider {
     return res.text();
   }
 
-  async postComment(prNumber: number, body: string): Promise<void> {
+  async fetchDiffRefs(prNumber: number): Promise<DiffRefs> {
+    const res = await this.request(
+      `/repos/${this.config.owner}/${this.config.repo}/pulls/${prNumber}`
+    );
+    const data: { head: { sha: string } } = await res.json();
+    return { headSha: data.head.sha };
+  }
+
+  async postReview(
+    prNumber: number,
+    refs: DiffRefs,
+    summary: string,
+    comments: InlineComment[]
+  ): Promise<void> {
     await this.request(
-      `/repos/${this.config.owner}/${this.config.repo}/issues/${prNumber}/comments`,
+      `/repos/${this.config.owner}/${this.config.repo}/pulls/${prNumber}/reviews`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({
+          commit_id: refs.headSha,
+          event: "COMMENT",
+          body: summary,
+          comments: comments.map((c) => ({
+            path: c.path,
+            line: c.line,
+            body: c.body,
+          })),
+        }),
       }
     );
   }
@@ -144,15 +206,67 @@ class GitlabProvider implements GitProvider {
       .join("\n");
   }
 
-  async postComment(prNumber: number, body: string): Promise<void> {
+  async fetchDiffRefs(prNumber: number): Promise<DiffRefs> {
+    const res = await this.request(
+      `/projects/${this.projectId}/merge_requests/${prNumber}`
+    );
+    const data: {
+      diff_refs: { base_sha: string; start_sha: string; head_sha: string };
+    } = await res.json();
+    return {
+      headSha: data.diff_refs.head_sha,
+      baseSha: data.diff_refs.base_sha,
+      startSha: data.diff_refs.start_sha,
+    };
+  }
+
+  async postReview(
+    prNumber: number,
+    refs: DiffRefs,
+    summary: string,
+    comments: InlineComment[]
+  ): Promise<void> {
+    if (comments.length === 0) {
+      await this.request(
+        `/projects/${this.projectId}/merge_requests/${prNumber}/notes`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ body: summary }),
+        }
+      );
+      return;
+    }
+
     await this.request(
       `/projects/${this.projectId}/merge_requests/${prNumber}/notes`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ body }),
+        body: JSON.stringify({ body: summary }),
       }
     );
+
+    for (const comment of comments) {
+      await this.request(
+        `/projects/${this.projectId}/merge_requests/${prNumber}/discussions`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            body: comment.body,
+            position: {
+              position_type: "text",
+              base_sha: refs.baseSha,
+              start_sha: refs.startSha,
+              head_sha: refs.headSha,
+              new_path: comment.path,
+              new_line: comment.line,
+            },
+          }),
+        }
+      );
+    }
   }
 }
 

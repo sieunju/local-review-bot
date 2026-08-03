@@ -34,6 +34,14 @@ interface ProviderConfig {
   repo: string;
 }
 
+export interface ProjectConfig {
+  provider: string;
+  url?: string;
+  token: string;
+  owner: string;
+  repo: string;
+}
+
 class GiteaProvider implements GitProvider {
   constructor(private config: ProviderConfig) {}
 
@@ -270,8 +278,10 @@ class GitlabProvider implements GitProvider {
   }
 }
 
-export function createGitProvider(config: ProviderConfig): GitProvider {
-  const provider = (process.env.GIT_PROVIDER ?? "gitea").toLowerCase();
+export function createGitProvider(
+  provider: string,
+  config: ProviderConfig
+): GitProvider {
   switch (provider) {
     case "gitea":
       return new GiteaProvider(config);

@@ -2,7 +2,7 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
-import { createGitProvider, InlineComment } from "./providers";
+import { createGitProvider, GitProvider, InlineComment, ProjectConfig } from "./providers";
 
 const DEFAULT_URLS: Record<string, string> = {
   gitea: "http://localhost:3000",
@@ -10,11 +10,27 @@ const DEFAULT_URLS: Record<string, string> = {
   gitlab: "https://gitlab.com",
 };
 
-const GIT_PROVIDER = (process.env.GIT_PROVIDER ?? "gitea").toLowerCase();
-const GIT_URL = process.env.GIT_URL ?? DEFAULT_URLS[GIT_PROVIDER];
-const GIT_TOKEN = requireEnv("GIT_TOKEN");
-const REPO_OWNER = requireEnv("REPO_OWNER");
-const REPO_NAME = requireEnv("REPO_NAME");
+function loadProjects(): ProjectConfig[] {
+  const reposJson = process.env.REPOS;
+  if (reposJson) {
+    return JSON.parse(reposJson) as ProjectConfig[];
+  }
+  return [
+    {
+      provider: process.env.GIT_PROVIDER ?? "gitea",
+      url: process.env.GIT_URL,
+      token: requireEnv("GIT_TOKEN"),
+      owner: requireEnv("REPO_OWNER"),
+      repo: requireEnv("REPO_NAME"),
+    },
+  ];
+}
+
+interface Project {
+  label: string;
+  provider: GitProvider;
+}
+
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
 const REVIEW_INTERVAL = Number(process.env.REVIEW_INTERVAL ?? 300);
@@ -31,42 +47,50 @@ function requireEnv(name: string): string {
 }
 
 const db = new Database(path.join(process.cwd(), "pr-reviewer.db"));
-db.exec(`
-  CREATE TABLE IF NOT EXISTS reviewed_prs (
-    pr_number INTEGER PRIMARY KEY,
-    reviewed_at TEXT NOT NULL,
-    head_sha TEXT
-  )
-`);
 const reviewedPrsColumns = db
   .prepare("PRAGMA table_info(reviewed_prs)")
   .all() as Array<{ name: string }>;
-if (!reviewedPrsColumns.some((c) => c.name === "head_sha")) {
-  db.exec("ALTER TABLE reviewed_prs ADD COLUMN head_sha TEXT");
+if (reviewedPrsColumns.length > 0 && !reviewedPrsColumns.some((c) => c.name === "project")) {
+  db.exec("DROP TABLE reviewed_prs");
 }
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reviewed_prs (
+    project TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    head_sha TEXT,
+    PRIMARY KEY (project, pr_number)
+  )
+`);
 
-const gitProvider = createGitProvider({
-  url: GIT_URL,
-  token: GIT_TOKEN,
-  owner: REPO_OWNER,
-  repo: REPO_NAME,
+const projects: Project[] = loadProjects().map((cfg) => {
+  const provider = cfg.provider.toLowerCase();
+  return {
+    label: `${cfg.owner}/${cfg.repo}`,
+    provider: createGitProvider(provider, {
+      url: cfg.url ?? DEFAULT_URLS[provider],
+      token: cfg.token,
+      owner: cfg.owner,
+      repo: cfg.repo,
+    }),
+  };
 });
 
 function isAndroidPullRequest(diff: string): boolean {
   return ANDROID_MARKERS.some((marker) => diff.includes(marker));
 }
 
-function isAlreadyReviewed(prNumber: number, headSha: string): boolean {
+function isAlreadyReviewed(project: string, prNumber: number, headSha: string): boolean {
   const row = db
-    .prepare("SELECT head_sha FROM reviewed_prs WHERE pr_number = ?")
-    .get(prNumber) as { head_sha: string } | undefined;
+    .prepare("SELECT head_sha FROM reviewed_prs WHERE project = ? AND pr_number = ?")
+    .get(project, prNumber) as { head_sha: string } | undefined;
   return row !== undefined && row.head_sha === headSha;
 }
 
-function markReviewed(prNumber: number, headSha: string): void {
+function markReviewed(project: string, prNumber: number, headSha: string): void {
   db.prepare(
-    "INSERT OR REPLACE INTO reviewed_prs (pr_number, reviewed_at, head_sha) VALUES (?, ?, ?)"
-  ).run(prNumber, new Date().toISOString(), headSha);
+    "INSERT OR REPLACE INTO reviewed_prs (project, pr_number, reviewed_at, head_sha) VALUES (?, ?, ?, ?)"
+  ).run(project, prNumber, new Date().toISOString(), headSha);
 }
 
 function readIfExists(fileName: string): string {
@@ -143,30 +167,37 @@ async function generateReview(diff: string): Promise<ParsedReview> {
   return parseReview(data.message.content);
 }
 
-async function reviewOpenPullRequests(): Promise<void> {
-  const prs = await gitProvider.fetchOpenPullRequests();
-  console.log(`\n📋 [${new Date().toLocaleTimeString()}] 오픈 PR 확인: ${prs.length}개`);
+async function reviewProject(project: Project): Promise<void> {
+  const { label, provider } = project;
+  const prs = await provider.fetchOpenPullRequests();
+  console.log(`\n📋 [${new Date().toLocaleTimeString()}] [${label}] 오픈 PR 확인: ${prs.length}개`);
 
   for (const pr of prs) {
-    const refs = await gitProvider.fetchDiffRefs(pr.number);
-    if (isAlreadyReviewed(pr.number, refs.headSha)) {
-      console.log(`⏭️  PR #${pr.number}: 이미 리뷰됨 (변경 없음)`);
+    const refs = await provider.fetchDiffRefs(pr.number);
+    if (isAlreadyReviewed(label, pr.number, refs.headSha)) {
+      console.log(`⏭️  [${label}] PR #${pr.number}: 이미 리뷰됨 (변경 없음)`);
       continue;
     }
 
-    const diff = await gitProvider.fetchDiff(pr.number);
+    const diff = await provider.fetchDiff(pr.number);
     if (!isAndroidPullRequest(diff)) {
-      console.log(`⏭️  PR #${pr.number}: Android 관련 아님`);
+      console.log(`⏭️  [${label}] PR #${pr.number}: Android 관련 아님`);
       continue;
     }
 
-    console.log(`🔍 PR #${pr.number} 리뷰 시작: "${pr.title}"`);
+    console.log(`🔍 [${label}] PR #${pr.number} 리뷰 시작: "${pr.title}"`);
     const review = await generateReview(diff);
-    await gitProvider.postReview(pr.number, refs, review.summary, review.comments);
-    markReviewed(pr.number, refs.headSha);
+    await provider.postReview(pr.number, refs, review.summary, review.comments);
+    markReviewed(label, pr.number, refs.headSha);
     console.log(
-      `✅ PR #${pr.number}에 리뷰 등록됨 (인라인 코멘트 ${review.comments.length}개)`
+      `✅ [${label}] PR #${pr.number}에 리뷰 등록됨 (인라인 코멘트 ${review.comments.length}개)`
     );
+  }
+}
+
+async function reviewOpenPullRequests(): Promise<void> {
+  for (const project of projects) {
+    await reviewProject(project);
   }
 }
 

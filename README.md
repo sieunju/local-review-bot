@@ -25,13 +25,28 @@ cp .env.example .env
 
 | 변수                       | 설명                                                                                                |
 | -------------------------- | --------------------------------------------------------------------------------------------------- |
-| `GIT_PROVIDER`             | `gitea` \| `github` \| `gitlab`                                                                     |
+| `GIT_PROVIDER`             | `gitea` \| `github` \| `gitlab` (저장소 1개만 볼 때)                                                |
 | `GIT_URL`                  | 호스팅 서버 루트 주소 (저장소 경로 제외). 생략 시 provider별 기본 호스트 사용                       |
 | `GIT_TOKEN`                | API 토큰. PR 조회 + 댓글 작성 권한 필요 (Gitea 기준 `read:repository`, `read:issue`, `write:issue`) |
 | `REPO_OWNER` / `REPO_NAME` | 저장소 소유자/이름                                                                                  |
+| `REPOS`                    | 여러 저장소를 볼 때 쓰는 JSON 배열. 설정하면 위 4개는 무시됨 (아래 [여러 프로젝트 보기](#여러-프로젝트-보기) 참고) |
 | `OLLAMA_URL`               | 기본 `http://localhost:11434`                                                                       |
 | `OLLAMA_MODEL`             | 로컬에 pull 받은 모델명                                                                             |
 | `REVIEW_INTERVAL`          | 폴링 주기(초), 기본 300                                                                             |
+| `REVIEW_LANGUAGE`          | 리뷰 코멘트 작성 언어 (예: `ko`, `en`), 기본 `ko`                                                    |
+
+### 여러 프로젝트 보기
+
+저장소를 하나 이상 감시하려면 `.env`에 `REPO_OWNER`/`REPO_NAME` 대신 `REPOS`를 JSON 배열로 설정합니다. 저장소마다 provider/서버/토큰이 달라도 됩니다 (로컬 Gitea + 회사 GitHub 같이 섞어서 사용 가능):
+
+```bash
+REPOS=[
+  {"provider":"gitea","url":"http://localhost:3000","token":"<gitea token>","owner":"my-org","repo":"android-banking"},
+  {"provider":"github","token":"<github PAT>","owner":"another-org","repo":"android-app"}
+]
+```
+
+`url`은 provider별 기본 호스트를 쓸 경우 생략 가능합니다. 각 프로젝트는 `owner/repo` 단위로 리뷰 이력이 따로 관리되어 서로 다른 저장소의 PR 번호가 겹쳐도 문제없습니다.
 
 ## 실행
 

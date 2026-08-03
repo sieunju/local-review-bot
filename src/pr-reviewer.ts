@@ -18,6 +18,7 @@ const REPO_NAME = requireEnv("REPO_NAME");
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
 const REVIEW_INTERVAL = Number(process.env.REVIEW_INTERVAL ?? 300);
+const REVIEW_LANGUAGE = process.env.REVIEW_LANGUAGE ?? "ko";
 
 const ANDROID_MARKERS = [".kt", ".java", "build.gradle", "build.gradle.kts"];
 
@@ -119,7 +120,7 @@ async function generateReview(diff: string): Promise<ParsedReview> {
       messages: [
         {
           role: "system",
-          content: `You are an Android code reviewer. Follow this team's review guide:\n\n${guide}\n\n${REVIEW_JSON_INSTRUCTIONS}`,
+          content: `You are an Android code reviewer. Follow this team's review guide:\n\n${guide}\n\nWrite the "summary" and all comment "body" text in ${REVIEW_LANGUAGE}.\n\n${REVIEW_JSON_INSTRUCTIONS}`,
         },
         {
           role: "user",

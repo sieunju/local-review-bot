@@ -34,9 +34,16 @@ const db = new Database(path.join(process.cwd(), "pr-reviewer.db"));
 db.exec(`
   CREATE TABLE IF NOT EXISTS reviewed_prs (
     pr_number INTEGER PRIMARY KEY,
-    reviewed_at TEXT NOT NULL
+    reviewed_at TEXT NOT NULL,
+    head_sha TEXT
   )
 `);
+const reviewedPrsColumns = db
+  .prepare("PRAGMA table_info(reviewed_prs)")
+  .all() as Array<{ name: string }>;
+if (!reviewedPrsColumns.some((c) => c.name === "head_sha")) {
+  db.exec("ALTER TABLE reviewed_prs ADD COLUMN head_sha TEXT");
+}
 
 const gitProvider = createGitProvider({
   url: GIT_URL,
@@ -49,17 +56,17 @@ function isAndroidPullRequest(diff: string): boolean {
   return ANDROID_MARKERS.some((marker) => diff.includes(marker));
 }
 
-function isAlreadyReviewed(prNumber: number): boolean {
+function isAlreadyReviewed(prNumber: number, headSha: string): boolean {
   const row = db
-    .prepare("SELECT 1 FROM reviewed_prs WHERE pr_number = ?")
-    .get(prNumber);
-  return row !== undefined;
+    .prepare("SELECT head_sha FROM reviewed_prs WHERE pr_number = ?")
+    .get(prNumber) as { head_sha: string } | undefined;
+  return row !== undefined && row.head_sha === headSha;
 }
 
-function markReviewed(prNumber: number): void {
+function markReviewed(prNumber: number, headSha: string): void {
   db.prepare(
-    "INSERT OR REPLACE INTO reviewed_prs (pr_number, reviewed_at) VALUES (?, ?)"
-  ).run(prNumber, new Date().toISOString());
+    "INSERT OR REPLACE INTO reviewed_prs (pr_number, reviewed_at, head_sha) VALUES (?, ?, ?)"
+  ).run(prNumber, new Date().toISOString(), headSha);
 }
 
 function readIfExists(fileName: string): string {
@@ -141,8 +148,9 @@ async function reviewOpenPullRequests(): Promise<void> {
   console.log(`\n📋 [${new Date().toLocaleTimeString()}] 오픈 PR 확인: ${prs.length}개`);
 
   for (const pr of prs) {
-    if (isAlreadyReviewed(pr.number)) {
-      console.log(`⏭️  PR #${pr.number}: 이미 리뷰됨`);
+    const refs = await gitProvider.fetchDiffRefs(pr.number);
+    if (isAlreadyReviewed(pr.number, refs.headSha)) {
+      console.log(`⏭️  PR #${pr.number}: 이미 리뷰됨 (변경 없음)`);
       continue;
     }
 
@@ -154,9 +162,8 @@ async function reviewOpenPullRequests(): Promise<void> {
 
     console.log(`🔍 PR #${pr.number} 리뷰 시작: "${pr.title}"`);
     const review = await generateReview(diff);
-    const refs = await gitProvider.fetchDiffRefs(pr.number);
     await gitProvider.postReview(pr.number, refs, review.summary, review.comments);
-    markReviewed(pr.number);
+    markReviewed(pr.number, refs.headSha);
     console.log(
       `✅ PR #${pr.number}에 리뷰 등록됨 (인라인 코멘트 ${review.comments.length}개)`
     );

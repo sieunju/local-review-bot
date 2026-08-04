@@ -84,6 +84,10 @@ npm run build && npm start   # 빌드 후 실행
 
 리뷰는 PR 전체에 대한 코멘트 하나가 아니라, Ollama가 `{summary, comments: [{file, line, body}]}` 형태의 JSON으로 응답하면 실제 diff의 해당 줄에 인라인 코멘트로 등록됩니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
 
+## 코멘트 자동 resolve (Gitea 전용)
+
+새 커밋이 푸시되어 PR이 재검토될 때, 이전에 지적했던 파일이 이번 리뷰에도 diff에 포함되어 있는데 같은 위치(`path:line`)가 더 이상 지적되지 않으면 수정된 것으로 보고 해당 리뷰 코멘트를 Gitea의 conversation resolve API로 자동 처리합니다. 라인 번호가 커밋 사이에 밀리면 같은 이슈라도 다시 지적될 수 있습니다 (휴리스틱 한계). GitHub/GitLab은 아직 미지원입니다.
+
 ## DB 초기화
 
 이미 리뷰한 PR은 `pr-reviewer.db`(SQLite)에 기록되어 중복 리뷰하지 않습니다. 초기화하려면:

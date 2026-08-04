@@ -9,6 +9,12 @@ export interface InlineComment {
   body: string;
 }
 
+export interface PostedComment {
+  id: number;
+  path: string;
+  line: number;
+}
+
 export interface DiffRefs {
   headSha: string;
   baseSha?: string;
@@ -24,7 +30,9 @@ export interface GitProvider {
     refs: DiffRefs,
     summary: string,
     comments: InlineComment[]
-  ): Promise<void>;
+  ): Promise<PostedComment[]>;
+  // Only Gitea supports resolving individual review comments right now.
+  resolveComments?(commentIds: number[]): Promise<void>;
 }
 
 interface ProviderConfig {
@@ -87,8 +95,8 @@ class GiteaProvider implements GitProvider {
     refs: DiffRefs,
     summary: string,
     comments: InlineComment[]
-  ): Promise<void> {
-    await this.request(
+  ): Promise<PostedComment[]> {
+    const res = await this.request(
       `/repos/${this.config.owner}/${this.config.repo}/pulls/${prNumber}/reviews`,
       {
         method: "POST",
@@ -105,6 +113,24 @@ class GiteaProvider implements GitProvider {
         }),
       }
     );
+    if (comments.length === 0) {
+      return [];
+    }
+    const review: { id: number } = await res.json();
+    const createdRes = await this.request(
+      `/repos/${this.config.owner}/${this.config.repo}/pulls/${prNumber}/reviews/${review.id}/comments`
+    );
+    const created: Array<{ id: number }> = await createdRes.json();
+    // Gitea returns created comments in the same order they were submitted.
+    return created.map((c, i) => ({ id: c.id, path: comments[i].path, line: comments[i].line }));
+  }
+
+  async resolveComments(commentIds: number[]): Promise<void> {
+    for (const id of commentIds) {
+      await this.request(`/repos/${this.config.owner}/${this.config.repo}/pulls/comments/${id}/resolve`, {
+        method: "POST",
+      });
+    }
   }
 }
 
@@ -154,7 +180,7 @@ class GithubProvider implements GitProvider {
     refs: DiffRefs,
     summary: string,
     comments: InlineComment[]
-  ): Promise<void> {
+  ): Promise<PostedComment[]> {
     await this.request(
       `/repos/${this.config.owner}/${this.config.repo}/pulls/${prNumber}/reviews`,
       {
@@ -172,6 +198,7 @@ class GithubProvider implements GitProvider {
         }),
       }
     );
+    return [];
   }
 }
 
@@ -234,19 +261,7 @@ class GitlabProvider implements GitProvider {
     refs: DiffRefs,
     summary: string,
     comments: InlineComment[]
-  ): Promise<void> {
-    if (comments.length === 0) {
-      await this.request(
-        `/projects/${this.projectId}/merge_requests/${prNumber}/notes`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ body: summary }),
-        }
-      );
-      return;
-    }
-
+  ): Promise<PostedComment[]> {
     await this.request(
       `/projects/${this.projectId}/merge_requests/${prNumber}/notes`,
       {
@@ -276,6 +291,7 @@ class GitlabProvider implements GitProvider {
         }
       );
     }
+    return [];
   }
 }
 

@@ -2,7 +2,7 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
-import { createGitProvider, GitProvider, InlineComment, ProjectConfig } from "./providers";
+import { createGitProvider, GitProvider, InlineComment, PostedComment, ProjectConfig } from "./providers";
 
 const DEFAULT_URLS: Record<string, string> = {
   gitea: "http://localhost:3000",
@@ -76,6 +76,17 @@ db.exec(`
     PRIMARY KEY (project, pr_number)
   )
 `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS review_comments (
+    project TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    comment_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    resolved INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (project, comment_id)
+  )
+`);
 
 const projects: Project[] = loadProjects().map((cfg) => {
   const provider = cfg.provider.toLowerCase();
@@ -110,6 +121,46 @@ function markReviewed(project: string, prNumber: number, headSha: string): void 
   db.prepare(
     "INSERT OR REPLACE INTO reviewed_prs (project, pr_number, reviewed_at, head_sha) VALUES (?, ?, ?, ?)"
   ).run(project, prNumber, new Date().toISOString(), headSha);
+}
+
+interface StoredComment {
+  comment_id: number;
+  path: string;
+  line: number;
+}
+
+function getUnresolvedComments(project: string, prNumber: number): StoredComment[] {
+  return db
+    .prepare(
+      "SELECT comment_id, path, line FROM review_comments WHERE project = ? AND pr_number = ? AND resolved = 0"
+    )
+    .all(project, prNumber) as StoredComment[];
+}
+
+function storeComments(project: string, prNumber: number, comments: PostedComment[]): void {
+  const insert = db.prepare(
+    "INSERT OR REPLACE INTO review_comments (project, pr_number, comment_id, path, line, resolved) VALUES (?, ?, ?, ?, ?, 0)"
+  );
+  for (const c of comments) {
+    insert.run(project, prNumber, c.id, c.path, c.line);
+  }
+}
+
+function markCommentsResolved(project: string, commentIds: number[]): void {
+  const update = db.prepare(
+    "UPDATE review_comments SET resolved = 1 WHERE project = ? AND comment_id = ?"
+  );
+  for (const id of commentIds) {
+    update.run(project, id);
+  }
+}
+
+function parseDiffFiles(diff: string): Set<string> {
+  const files = new Set<string>();
+  for (const match of diff.matchAll(/^\+\+\+ b\/(.+)$/gm)) {
+    files.add(match[1]);
+  }
+  return files;
 }
 
 function readIfExists(fileName: string): string {
@@ -210,12 +261,27 @@ async function reviewProject(project: Project): Promise<void> {
     }
 
     console.log(`🔍 [${label}] PR #${pr.number} 리뷰 시작: "${pr.title}"`);
+    const previousComments = getUnresolvedComments(label, pr.number);
     const review = await generateReview(diff, stack);
-    await provider.postReview(pr.number, refs, review.summary, review.comments);
+    const posted = await provider.postReview(pr.number, refs, review.summary, review.comments);
     markReviewed(label, pr.number, refs.headSha);
+    storeComments(label, pr.number, posted);
     console.log(
       `✅ [${label}] PR #${pr.number}에 리뷰 등록됨 (인라인 코멘트 ${review.comments.length}개)`
     );
+
+    if (provider.resolveComments && previousComments.length > 0) {
+      const touchedFiles = parseDiffFiles(diff);
+      const stillFlagged = new Set(review.comments.map((c) => `${c.path}:${c.line}`));
+      const toResolve = previousComments.filter(
+        (c) => touchedFiles.has(c.path) && !stillFlagged.has(`${c.path}:${c.line}`)
+      );
+      if (toResolve.length > 0) {
+        await provider.resolveComments(toResolve.map((c) => c.comment_id));
+        markCommentsResolved(label, toResolve.map((c) => c.comment_id));
+        console.log(`✅ [${label}] PR #${pr.number}: 코멘트 ${toResolve.length}개 resolve 처리`);
+      }
+    }
   }
 }
 

@@ -40,6 +40,7 @@ export interface ProjectConfig {
   token: string;
   owner: string;
   repo: string;
+  stack?: string;
 }
 
 class GiteaProvider implements GitProvider {

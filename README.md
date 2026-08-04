@@ -1,6 +1,6 @@
 # local-review-bot
 
-Gitea/GitHub/GitLab의 오픈 PR 중 Android 관련 변경(`.kt`, `.java`, `gradle`)을 감지해 로컬 Ollama 모델로 자동 리뷰 댓글을 다는 봇.
+Gitea/GitHub/GitLab의 오픈 PR 중 Android(`.kt`, `.java`, `gradle`) / iOS(`.swift`, `.m`, `Podfile`) / Web(`.ts`, `.tsx`, `.js`, `.vue` 등) 관련 변경을 감지해 로컬 Ollama 모델로 자동 리뷰 댓글을 다는 봇. 저장소마다 스택을 다르게 지정할 수 있습니다.
 
 ## 왜 폴링 방식인가
 
@@ -29,7 +29,8 @@ cp .env.example .env
 | `GIT_URL`                  | 호스팅 서버 루트 주소 (저장소 경로 제외). 생략 시 provider별 기본 호스트 사용                       |
 | `GIT_TOKEN`                | API 토큰. PR 조회 + 댓글 작성 권한 필요 (Gitea 기준 `read:repository`, `read:issue`, `write:issue`) |
 | `REPO_OWNER` / `REPO_NAME` | 저장소 소유자/이름                                                                                  |
-| `REPOS`                    | 여러 저장소를 볼 때 쓰는 JSON 배열. 설정하면 위 4개는 무시됨 (아래 [여러 프로젝트 보기](#여러-프로젝트-보기) 참고) |
+| `STACK`                    | 리뷰 페르소나. `android` \| `ios` \| `web`, 기본 `android` (저장소 1개만 볼 때)                     |
+| `REPOS`                    | 여러 저장소를 볼 때 쓰는 JSON 배열. 설정하면 위 5개는 무시됨 (아래 [여러 프로젝트 보기](#여러-프로젝트-보기) 참고) |
 | `OLLAMA_URL`               | 기본 `http://localhost:11434`                                                                       |
 | `OLLAMA_MODEL`             | 로컬에 pull 받은 모델명                                                                             |
 | `REVIEW_INTERVAL`          | 폴링 주기(초), 기본 300                                                                             |
@@ -37,16 +38,17 @@ cp .env.example .env
 
 ### 여러 프로젝트 보기
 
-저장소를 하나 이상 감시하려면 `.env`에 `REPO_OWNER`/`REPO_NAME` 대신 `REPOS`를 JSON 배열로 설정합니다. 저장소마다 provider/서버/토큰이 달라도 됩니다 (로컬 Gitea + 회사 GitHub 같이 섞어서 사용 가능):
+저장소를 하나 이상 감시하려면 `.env`에 `REPO_OWNER`/`REPO_NAME` 대신 `REPOS`를 JSON 배열로 설정합니다. 저장소마다 provider/서버/토큰/스택이 달라도 됩니다 (로컬 Gitea + 회사 GitHub, Android + iOS + Web 섞어서 사용 가능):
 
 ```bash
 REPOS=[
-  {"provider":"gitea","url":"http://localhost:3000","token":"<gitea token>","owner":"my-org","repo":"android-banking"},
-  {"provider":"github","token":"<github PAT>","owner":"another-org","repo":"android-app"}
+  {"provider":"gitea","url":"http://localhost:3000","token":"<gitea token>","owner":"my-org","repo":"android-banking","stack":"android"},
+  {"provider":"github","token":"<github PAT>","owner":"another-org","repo":"ios-app","stack":"ios"},
+  {"provider":"github","token":"<github PAT>","owner":"another-org","repo":"web-app","stack":"web"}
 ]
 ```
 
-`url`은 provider별 기본 호스트를 쓸 경우 생략 가능합니다. 각 프로젝트는 `owner/repo` 단위로 리뷰 이력이 따로 관리되어 서로 다른 저장소의 PR 번호가 겹쳐도 문제없습니다.
+`url`은 provider별 기본 호스트를 쓸 경우 생략 가능하고, `stack`을 생략하면 `android`로 취급됩니다. 각 프로젝트는 `owner/repo` 단위로 리뷰 이력이 따로 관리되어 서로 다른 저장소의 PR 번호가 겹쳐도 문제없습니다.
 
 ## 실행
 
@@ -68,9 +70,15 @@ npm run build && npm start   # 빌드 후 실행
 
 ## 리뷰 페르소나
 
-[CLAUDE.md](CLAUDE.md) 내용이 그대로 리뷰 모델의 시스템 프롬프트에 들어갑니다. 팀 리뷰 기준을 바꾸려면 코드가 아니라 이 파일만 수정하면 됩니다.
+프로젝트의 `stack`에 따라 다른 가이드 파일이 리뷰 모델의 시스템 프롬프트에 그대로 들어갑니다. 팀 리뷰 기준을 바꾸려면 코드가 아니라 해당 가이드 파일만 수정하면 됩니다.
 
-[REFERENCE.md](REFERENCE.md)가 있으면 `CLAUDE.md` 뒤에 이어붙여서 같이 시스템 프롬프트에 포함됩니다. 로컬 모델이 스스로 찾아볼 수 없는 라이브러리 지식(OkHttp/Retrofit, RxJava-Flow, Lifecycle, Room, MVVM/MVI, 모듈화 등)을 미리 주입하는 용도입니다. 없어도 정상 동작합니다.
+| stack     | 가이드 파일                             | 보조 지식 파일 (선택)                    |
+| --------- | ---------------------------------------- | ----------------------------------------- |
+| `android` | [CLAUDE.md](CLAUDE.md)                   | [REFERENCE.md](REFERENCE.md)             |
+| `ios`     | [CLAUDE_IOS.md](CLAUDE_IOS.md)           | `REFERENCE_IOS.md`                        |
+| `web`     | [CLAUDE_WEB.md](CLAUDE_WEB.md)           | `REFERENCE_WEB.md`                        |
+
+보조 지식 파일이 있으면 가이드 파일 뒤에 이어붙여서 같이 시스템 프롬프트에 포함됩니다. 로컬 모델이 스스로 찾아볼 수 없는 라이브러리 지식(예: Android는 OkHttp/Retrofit/RxJava-Flow/Room, iOS는 Combine/SwiftUI/Core Data, Web은 React Query/상태관리 등)을 미리 주입하는 용도이며, 없어도 정상 동작합니다.
 
 ## 인라인 리뷰 코멘트
 

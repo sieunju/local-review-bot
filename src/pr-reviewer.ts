@@ -22,6 +22,7 @@ function loadProjects(): ProjectConfig[] {
       token: requireEnv("GIT_TOKEN"),
       owner: requireEnv("REPO_OWNER"),
       repo: requireEnv("REPO_NAME"),
+      stack: process.env.STACK ?? "android",
     },
   ];
 }
@@ -29,7 +30,20 @@ function loadProjects(): ProjectConfig[] {
 interface Project {
   label: string;
   provider: GitProvider;
+  stack: string;
 }
+
+const STACK_MARKERS: Record<string, string[]> = {
+  android: [".kt", ".java", "build.gradle", "build.gradle.kts"],
+  ios: [".swift", ".m", ".h", "Podfile", ".xcodeproj", ".pbxproj"],
+  web: [".ts", ".tsx", ".js", ".jsx", ".vue", "package.json"],
+};
+
+const STACK_LABELS: Record<string, string> = {
+  android: "Android",
+  ios: "iOS",
+  web: "Web frontend",
+};
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
@@ -37,8 +51,6 @@ const REVIEW_INTERVAL = Number(process.env.REVIEW_INTERVAL ?? 300);
 const REVIEW_LANGUAGE = process.env.REVIEW_LANGUAGE ?? "ko";
 const REVIEW_LANGUAGE_NAMES: Record<string, string> = { ko: "Korean (한국어)", en: "English", ja: "Japanese (日本語)" };
 const REVIEW_LANGUAGE_NAME = REVIEW_LANGUAGE_NAMES[REVIEW_LANGUAGE] ?? REVIEW_LANGUAGE;
-
-const ANDROID_MARKERS = [".kt", ".java", "build.gradle", "build.gradle.kts"];
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -67,6 +79,10 @@ db.exec(`
 
 const projects: Project[] = loadProjects().map((cfg) => {
   const provider = cfg.provider.toLowerCase();
+  const stack = (cfg.stack ?? "android").toLowerCase();
+  if (!STACK_MARKERS[stack]) {
+    throw new Error(`Unknown stack "${stack}" for ${cfg.owner}/${cfg.repo}. Supported: ${Object.keys(STACK_MARKERS).join(", ")}`);
+  }
   return {
     label: `${cfg.owner}/${cfg.repo}`,
     provider: createGitProvider(provider, {
@@ -75,11 +91,12 @@ const projects: Project[] = loadProjects().map((cfg) => {
       owner: cfg.owner,
       repo: cfg.repo,
     }),
+    stack,
   };
 });
 
-function isAndroidPullRequest(diff: string): boolean {
-  return ANDROID_MARKERS.some((marker) => diff.includes(marker));
+function isRelevantPullRequest(diff: string, stack: string): boolean {
+  return STACK_MARKERS[stack].some((marker) => diff.includes(marker));
 }
 
 function isAlreadyReviewed(project: string, prNumber: number, headSha: string): boolean {
@@ -100,9 +117,11 @@ function readIfExists(fileName: string): string {
   return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf-8") : "";
 }
 
-function loadReviewGuide(): string {
-  const guide = readIfExists("CLAUDE.md");
-  const reference = readIfExists("REFERENCE.md");
+function loadReviewGuide(stack: string): string {
+  const guideFile = stack === "android" ? "CLAUDE.md" : `CLAUDE_${stack.toUpperCase()}.md`;
+  const referenceFile = stack === "android" ? "REFERENCE.md" : `REFERENCE_${stack.toUpperCase()}.md`;
+  const guide = readIfExists(guideFile);
+  const reference = readIfExists(referenceFile);
   return reference ? `${guide}\n\n---\n\n${reference}` : guide;
 }
 
@@ -143,8 +162,9 @@ function parseReview(raw: string): ParsedReview {
   }
 }
 
-async function generateReview(diff: string): Promise<ParsedReview> {
-  const guide = loadReviewGuide();
+async function generateReview(diff: string, stack: string): Promise<ParsedReview> {
+  const guide = loadReviewGuide(stack);
+  const stackLabel = STACK_LABELS[stack];
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -154,7 +174,7 @@ async function generateReview(diff: string): Promise<ParsedReview> {
       messages: [
         {
           role: "system",
-          content: `You are an Android code reviewer. Follow this team's review guide:\n\n${guide}\n\nWrite the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.\n\n${REVIEW_JSON_INSTRUCTIONS}`,
+          content: `You are a ${stackLabel} code reviewer. Follow this team's review guide:\n\n${guide}\n\nWrite the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.\n\n${REVIEW_JSON_INSTRUCTIONS}`,
         },
         {
           role: "user",
@@ -172,7 +192,7 @@ async function generateReview(diff: string): Promise<ParsedReview> {
 }
 
 async function reviewProject(project: Project): Promise<void> {
-  const { label, provider } = project;
+  const { label, provider, stack } = project;
   const prs = await provider.fetchOpenPullRequests();
   console.log(`\n📋 [${new Date().toLocaleTimeString()}] [${label}] 오픈 PR 확인: ${prs.length}개`);
 
@@ -184,13 +204,13 @@ async function reviewProject(project: Project): Promise<void> {
     }
 
     const diff = await provider.fetchDiff(pr.number);
-    if (!isAndroidPullRequest(diff)) {
-      console.log(`⏭️  [${label}] PR #${pr.number}: Android 관련 아님`);
+    if (!isRelevantPullRequest(diff, stack)) {
+      console.log(`⏭️  [${label}] PR #${pr.number}: ${STACK_LABELS[stack]} 관련 아님`);
       continue;
     }
 
     console.log(`🔍 [${label}] PR #${pr.number} 리뷰 시작: "${pr.title}"`);
-    const review = await generateReview(diff);
+    const review = await generateReview(diff, stack);
     await provider.postReview(pr.number, refs, review.summary, review.comments);
     markReviewed(label, pr.number, refs.headSha);
     console.log(

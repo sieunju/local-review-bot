@@ -138,7 +138,7 @@ Respond with ONLY valid JSON (no markdown fences, no extra text) in this exact s
     { "file": "path/to/File.kt", "line": 42, "body": "review comment for this line" }
   ]
 }
-"line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Omit comments you are not confident about the line number for.
+"line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Calculate it from the hunk header "@@ -oldStart,oldCount +newStart,newCount @@": newStart + L, where L is the number of lines (added AND unchanged context lines, but NOT removed "-" lines) counted from the first line after that header down to the line you want to comment on (the first line after the header is L=0). Recompute newStart from each new "@@" header you cross. Omit comments you are not confident about the line number for.
 IMPORTANT: write "summary" and every comment "body" in ${REVIEW_LANGUAGE_NAME}, regardless of what language the guide or diff above is in.
 `;
 

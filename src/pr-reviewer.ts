@@ -35,6 +35,8 @@ const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
 const REVIEW_INTERVAL = Number(process.env.REVIEW_INTERVAL ?? 300);
 const REVIEW_LANGUAGE = process.env.REVIEW_LANGUAGE ?? "ko";
+const REVIEW_LANGUAGE_NAMES: Record<string, string> = { ko: "Korean (한국어)", en: "English", ja: "Japanese (日本語)" };
+const REVIEW_LANGUAGE_NAME = REVIEW_LANGUAGE_NAMES[REVIEW_LANGUAGE] ?? REVIEW_LANGUAGE;
 
 const ANDROID_MARKERS = [".kt", ".java", "build.gradle", "build.gradle.kts"];
 
@@ -118,6 +120,7 @@ Respond with ONLY valid JSON (no markdown fences, no extra text) in this exact s
   ]
 }
 "line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Omit comments you are not confident about the line number for.
+IMPORTANT: write "summary" and every comment "body" in ${REVIEW_LANGUAGE_NAME}, regardless of what language the guide or diff above is in.
 `;
 
 function parseReview(raw: string): ParsedReview {
@@ -151,7 +154,7 @@ async function generateReview(diff: string): Promise<ParsedReview> {
       messages: [
         {
           role: "system",
-          content: `You are an Android code reviewer. Follow this team's review guide:\n\n${guide}\n\nWrite the "summary" and all comment "body" text in ${REVIEW_LANGUAGE}.\n\n${REVIEW_JSON_INSTRUCTIONS}`,
+          content: `You are an Android code reviewer. Follow this team's review guide:\n\n${guide}\n\nWrite the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.\n\n${REVIEW_JSON_INSTRUCTIONS}`,
         },
         {
           role: "user",

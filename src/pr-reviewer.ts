@@ -167,6 +167,7 @@ async function generateReview(diff: string): Promise<ParsedReview> {
     throw new Error(`Ollama API error: ${res.status}`);
   }
   const data = (await res.json()) as { message: { content: string } };
+  console.log(`🤖 Ollama 응답:\n${data.message.content}`);
   return parseReview(data.message.content);
 }
 

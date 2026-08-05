@@ -1,8 +1,10 @@
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
+import { execFileSync } from "child_process";
 import Database from "better-sqlite3";
-import { createGitProvider, GitProvider, InlineComment, PostedComment, ProjectConfig } from "./providers";
+import { createGitProvider, DiffRefs, GitProvider, InlineComment, PostedComment, ProjectConfig } from "./providers";
+import { buildCallerContext, detectJavaToKotlinMigrations } from "./migration-context";
 
 const DEFAULT_URLS: Record<string, string> = {
   gitea: "http://localhost:3000",
@@ -47,10 +49,19 @@ const STACK_LABELS: Record<string, string> = {
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
+const OLLAMA_NUM_CTX = Number(process.env.OLLAMA_NUM_CTX ?? 16384);
+const OLLAMA_TEMPERATURE = Number(process.env.OLLAMA_TEMPERATURE ?? 0.2);
 const REVIEW_INTERVAL = Number(process.env.REVIEW_INTERVAL ?? 300);
 const REVIEW_LANGUAGE = process.env.REVIEW_LANGUAGE ?? "ko";
 const REVIEW_LANGUAGE_NAMES: Record<string, string> = { ko: "Korean (한국어)", en: "English", ja: "Japanese (日本語)" };
 const REVIEW_LANGUAGE_NAME = REVIEW_LANGUAGE_NAMES[REVIEW_LANGUAGE] ?? REVIEW_LANGUAGE;
+
+// "owner/repo" -> local clone path, used to grep Java→Kotlin migration
+// call sites on the base branch. See MIGRATION.md.
+const REPO_PATHS: Record<string, string> = process.env.REPO_PATHS
+  ? JSON.parse(process.env.REPO_PATHS)
+  : {};
+const FALLBACK_BASE_REF = process.env.BASE_REF ?? "origin/develop";
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -58,6 +69,26 @@ function requireEnv(name: string): string {
     throw new Error(`Missing required env var: ${name}`);
   }
   return value;
+}
+
+// DiffRefs only guarantees `baseSha` today, but provider implementations
+// have used different field names historically — check the real field first,
+// then a few likely aliases, before giving up and falling back.
+function resolveBaseRef(refs: DiffRefs): string {
+  const candidates = refs as unknown as Record<string, unknown>;
+  const candidate =
+    candidates.baseSha ?? candidates.base ?? candidates.baseCommitSha ?? candidates.baseRef;
+  return typeof candidate === "string" && candidate.length > 0 ? candidate : FALLBACK_BASE_REF;
+}
+
+function refreshRepo(repoPath: string): void {
+  try {
+    execFileSync("git", ["-C", repoPath, "fetch", "--all", "--prune", "--quiet"], {
+      stdio: "ignore",
+    });
+  } catch (err) {
+    console.warn(`⚠️  git fetch 실패 (${repoPath}): ${(err as Error).message}`);
+  }
 }
 
 const db = new Database(path.join(process.cwd(), "pr-reviewer.db"));
@@ -213,23 +244,39 @@ function parseReview(raw: string): ParsedReview {
   }
 }
 
-async function generateReview(diff: string, stack: string): Promise<ParsedReview> {
+async function generateReview(diff: string, stack: string, callerContext: string): Promise<ParsedReview> {
   const guide = loadReviewGuide(stack);
   const stackLabel = STACK_LABELS[stack];
+
+  // Only pull in the migration review guide (and pay its context cost) on
+  // PRs where we actually found caller context to check it against.
+  const migrationGuide = callerContext ? readIfExists("MIGRATION.md") : "";
+  const systemParts = [`You are a ${stackLabel} code reviewer. Follow this team's review guide:\n\n${guide}`];
+  if (migrationGuide) {
+    systemParts.push(migrationGuide);
+  }
+  systemParts.push(`Write the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.`);
+  systemParts.push(REVIEW_JSON_INSTRUCTIONS);
+
+  const userContent = callerContext
+    ? `${callerContext}\n\n=== DIFF (리뷰 대상 — 코멘트는 이 안의 파일/라인에만 달 수 있음) ===\n${diff}`
+    : `Review the following diff and leave concise, actionable feedback:\n\n${diff}`;
+
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model: OLLAMA_MODEL,
       stream: false,
+      options: { num_ctx: OLLAMA_NUM_CTX, temperature: OLLAMA_TEMPERATURE },
       messages: [
         {
           role: "system",
-          content: `You are a ${stackLabel} code reviewer. Follow this team's review guide:\n\n${guide}\n\nWrite the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.\n\n${REVIEW_JSON_INSTRUCTIONS}`,
+          content: systemParts.join("\n\n"),
         },
         {
           role: "user",
-          content: `Review the following diff and leave concise, actionable feedback:\n\n${diff}`,
+          content: userContent,
         },
       ],
     }),
@@ -237,8 +284,14 @@ async function generateReview(diff: string, stack: string): Promise<ParsedReview
   if (!res.ok) {
     throw new Error(`Ollama API error: ${res.status}`);
   }
-  const data = (await res.json()) as { message: { content: string } };
+  const data = (await res.json()) as { message: { content: string }; prompt_eval_count?: number };
   console.log(`🤖 Ollama 응답:\n${data.message.content}`);
+  if (typeof data.prompt_eval_count === "number") {
+    console.log(`📊 prompt tokens: ${data.prompt_eval_count} / num_ctx ${OLLAMA_NUM_CTX}`);
+    if (data.prompt_eval_count > OLLAMA_NUM_CTX * 0.9) {
+      console.warn(`⚠️  prompt tokens가 num_ctx(${OLLAMA_NUM_CTX})의 90%를 넘었습니다 — 프롬프트가 잘렸을 수 있습니다.`);
+    }
+  }
   return parseReview(data.message.content);
 }
 
@@ -262,7 +315,28 @@ async function reviewProject(project: Project): Promise<void> {
 
     console.log(`🔍 [${label}] PR #${pr.number} 리뷰 시작: "${pr.title}"`);
     const previousComments = getUnresolvedComments(label, pr.number);
-    const review = await generateReview(diff, stack);
+
+    let callerContext = "";
+    if (stack === "android") {
+      const migrations = detectJavaToKotlinMigrations(diff);
+      if (migrations.length > 0) {
+        const repoPath = REPO_PATHS[label];
+        const classNames = migrations.map((m) => m.className).join(", ");
+        if (!repoPath) {
+          console.warn(
+            `⚠️  [${label}] PR #${pr.number}: 마이그레이션 감지됨(${classNames})이지만 REPO_PATHS에 로컬 클론 경로가 없어 호출처 컨텍스트를 건너뜁니다`
+          );
+        } else {
+          refreshRepo(repoPath);
+          callerContext = buildCallerContext(migrations, repoPath, resolveBaseRef(refs));
+          console.log(
+            `🔀 [${label}] PR #${pr.number}: 마이그레이션 ${migrations.length}건 (${classNames}) → 호출처 컨텍스트 ${callerContext.length}자`
+          );
+        }
+      }
+    }
+
+    const review = await generateReview(diff, stack, callerContext);
     const posted = await provider.postReview(pr.number, refs, review.summary, review.comments);
     markReviewed(label, pr.number, refs.headSha);
     storeComments(label, pr.number, posted);

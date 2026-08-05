@@ -2,7 +2,17 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import Database from "better-sqlite3";
+import { Agent, setGlobalDispatcher } from "undici";
 import { createGitProvider, GitProvider, InlineComment, PostedComment, ProjectConfig } from "./providers";
+
+// Node's built-in fetch is undici under the hood, and defaults to a 300s
+// headersTimeout/bodyTimeout. generateReview() calls Ollama with
+// stream:false, so it sends nothing — not even response headers — until
+// generation is fully done. A large num_ctx or a slow local model can push
+// that past 5 minutes, tripping undici's HeadersTimeoutError before Ollama
+// ever gets to respond.
+const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS ?? 20 * 60_000);
+setGlobalDispatcher(new Agent({ headersTimeout: OLLAMA_TIMEOUT_MS, bodyTimeout: OLLAMA_TIMEOUT_MS }));
 
 const DEFAULT_URLS: Record<string, string> = {
   gitea: "http://localhost:3000",

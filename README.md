@@ -33,6 +33,7 @@ cp .env.example .env
 | `REPOS`                    | 여러 저장소를 볼 때 쓰는 JSON 배열. 설정하면 위 5개는 무시됨 (아래 [여러 프로젝트 보기](#여러-프로젝트-보기) 참고) |
 | `OLLAMA_URL`               | 기본 `http://localhost:11434`                                                                       |
 | `OLLAMA_MODEL`             | 로컬에 pull 받은 모델명                                                                             |
+| `OLLAMA_TIMEOUT_MS`         | Ollama 요청 fetch 타임아웃(ms), 기본 1200000(20분). 프롬프트가 크거나 로컬 모델이 느리면 Node 기본 타임아웃(5분)에 걸려 `HeadersTimeoutError`가 날 수 있어 넉넉히 잡음 |
 | `REVIEW_INTERVAL`          | 폴링 주기(초), 기본 300                                                                             |
 | `REVIEW_LANGUAGE`          | 리뷰 코멘트 작성 언어 (예: `ko`, `en`), 기본 `ko`                                                    |
 

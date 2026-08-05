@@ -33,8 +33,12 @@ cp .env.example .env
 | `REPOS`                    | 여러 저장소를 볼 때 쓰는 JSON 배열. 설정하면 위 5개는 무시됨 (아래 [여러 프로젝트 보기](#여러-프로젝트-보기) 참고) |
 | `OLLAMA_URL`               | 기본 `http://localhost:11434`                                                                       |
 | `OLLAMA_MODEL`             | 로컬에 pull 받은 모델명                                                                             |
+| `OLLAMA_NUM_CTX`           | Ollama 컨텍스트 윈도우 크기(토큰), 기본 16384. 생략하면 Ollama 기본값(4096)이 적용돼 가이드+diff가 길 때 프롬프트가 잘릴 수 있음 |
+| `OLLAMA_TEMPERATURE`       | Ollama 생성 temperature, 기본 0.2                                                                   |
 | `REVIEW_INTERVAL`          | 폴링 주기(초), 기본 300                                                                             |
 | `REVIEW_LANGUAGE`          | 리뷰 코멘트 작성 언어 (예: `ko`, `en`), 기본 `ko`                                                    |
+| `REPO_PATHS`                | Java→Kotlin 마이그레이션 리뷰용 `{"owner/repo": "로컬 클론 경로"}` JSON, 기본 `{}` (아래 [마이그레이션 리뷰](#javakotlin-마이그레이션-리뷰) 참고) |
+| `BASE_REF`                  | 위 기능에서 `DiffRefs`에 base sha가 없을 때 쓰는 폴백 base ref, 기본 `origin/develop`               |
 
 ### 여러 프로젝트 보기
 
@@ -83,6 +87,26 @@ npm run build && npm start   # 빌드 후 실행
 ## 인라인 리뷰 코멘트
 
 리뷰는 PR 전체에 대한 코멘트 하나가 아니라, Ollama가 `{summary, comments: [{file, line, body}]}` 형태의 JSON으로 응답하면 실제 diff의 해당 줄에 인라인 코멘트로 등록됩니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
+
+## Java→Kotlin 마이그레이션 리뷰
+
+`android` 스택 PR에서 diff가 `Foo.java` 삭제 + `Foo.kt` 추가(또는 rename) 패턴이면 자동으로
+마이그레이션 리뷰 모드가 붙습니다. diff만으로는 이 클래스를 "호출하는 쪽" 코드가 안 보여서
+nullable 관련 회귀를 모델이 놓치기 쉬운데, 이를 보완하기 위해 base 브랜치에서 호출처를 직접
+grep해서 프롬프트에 같이 넣어줍니다.
+
+동작 방식:
+
+1. diff에서 마이그레이션된 Kotlin 파일의 public 함수/nullable 프로퍼티 심볼을 추출합니다.
+2. 해당 저장소가 `REPO_PATHS`에 등록되어 있으면 그 로컬 클론에서 `git fetch`로 base 브랜치를
+   최신화하고, 각 심볼을 `git grep`으로 검색해 호출처 스니펫을 만듭니다.
+3. 스니펫과 함께 [MIGRATION.md](MIGRATION.md) 가이드(nullable 검증 최우선, 근거 없는 추측 금지 등)를
+   시스템 프롬프트에 추가로 주입합니다.
+
+`REPO_PATHS`에 등록되지 않은 저장소는 경고 로그만 남기고 기존과 동일하게 동작하며, 등록된
+경로는 **반드시 일반(non-bare) 클론**이어야 합니다. 이 봇이 쓰기 작업(커밋 등)을 하진 않지만,
+`git fetch`/`git show`/`git grep`을 실행하므로 봇 프로세스가 그 디렉토리에 쓰기 권한을 가진
+전용 클론을 두는 걸 권장합니다.
 
 ## 코멘트 자동 resolve (Gitea 전용)
 

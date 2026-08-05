@@ -35,6 +35,7 @@ cp .env.example .env
 | `OLLAMA_MODEL`             | 로컬에 pull 받은 모델명                                                                             |
 | `OLLAMA_NUM_CTX`           | Ollama 컨텍스트 윈도우 크기(토큰), 기본 16384. 생략하면 Ollama 기본값(4096)이 적용돼 가이드+diff가 길 때 프롬프트가 잘릴 수 있음 |
 | `OLLAMA_TEMPERATURE`       | Ollama 생성 temperature, 기본 0.2                                                                   |
+| `OLLAMA_TIMEOUT_MS`         | Ollama 요청 fetch 타임아웃(ms), 기본 1200000(20분). `num_ctx`가 크거나 로컬 모델이 느리면 Node 기본 타임아웃(5분)에 걸려 `HeadersTimeoutError`가 날 수 있어 넉넉히 잡음 |
 | `REVIEW_INTERVAL`          | 폴링 주기(초), 기본 300                                                                             |
 | `REVIEW_LANGUAGE`          | 리뷰 코멘트 작성 언어 (예: `ko`, `en`), 기본 `ko`                                                    |
 | `REPO_PATHS`                | Java→Kotlin 마이그레이션 리뷰용 `{"owner/repo": "로컬 클론 경로"}` JSON, 기본 `{}` (아래 [마이그레이션 리뷰](#javakotlin-마이그레이션-리뷰) 참고) |

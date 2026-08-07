@@ -324,7 +324,10 @@ async function reviewProject(project: Project): Promise<void> {
       continue;
     }
 
-    console.log(`🔍 [${label}] PR #${pr.number} 리뷰 시작: "${pr.title}"`);
+    const reviewStartedAt = Date.now();
+    console.log(
+      `🔍 [${label}] PR #${pr.number} 리뷰 시작 (${new Date(reviewStartedAt).toLocaleTimeString()}): "${pr.title}"`
+    );
     const previousComments = getUnresolvedComments(label, pr.number);
 
     let callerContext = "";
@@ -351,8 +354,9 @@ async function reviewProject(project: Project): Promise<void> {
     const posted = await provider.postReview(pr.number, refs, review.summary, review.comments);
     markReviewed(label, pr.number, refs.headSha);
     storeComments(label, pr.number, posted);
+    const takeTime = ((Date.now() - reviewStartedAt) / 1000).toFixed(1);
     console.log(
-      `✅ [${label}] PR #${pr.number}에 리뷰 등록됨 (인라인 코멘트 ${review.comments.length}개)`
+      `✅ [${label}] PR #${pr.number}에 리뷰 등록됨 (인라인 코멘트 ${review.comments.length}개, takeTime ${takeTime}s)`
     );
 
     if (provider.resolveComments && previousComments.length > 0) {

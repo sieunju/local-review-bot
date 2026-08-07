@@ -79,7 +79,7 @@ npm run build && npm start   # 빌드 후 실행
 
 | stack     | 가이드 파일                             | 보조 지식 파일 (선택)                    |
 | --------- | ---------------------------------------- | ----------------------------------------- |
-| `android` | [CLAUDE.md](CLAUDE.md)                   | [REFERENCE.md](REFERENCE.md)             |
+| `android` | [CLAUDE_ANDROID.md](CLAUDE_ANDROID.md)   | [REFERENCE_ANDROID.md](REFERENCE_ANDROID.md) |
 | `ios`     | [CLAUDE_IOS.md](CLAUDE_IOS.md)           | `REFERENCE_IOS.md`                        |
 | `web`     | [CLAUDE_WEB.md](CLAUDE_WEB.md)           | `REFERENCE_WEB.md`                        |
 

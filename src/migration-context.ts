@@ -90,8 +90,8 @@ function extractSymbols(addedLines: string[]): { symbols: string[]; signatures: 
     if (line.startsWith("//") || line.startsWith("*") || line.startsWith("/*")) continue;
     if (/^(private|internal)\b/.test(line)) continue;
 
-    // fun name(...) / fun <T> name(...)
-    const funMatch = line.match(/\bfun\s+(?:<[^>]*>\s*)?([A-Za-z_]\w*)\s*\(/);
+    // fun name(...) / fun <T> name(...) / fun Receiver.name(...) (extension functions)
+    const funMatch = line.match(/\bfun\s+(?:<[^>]*>\s*)?(?:[\w.<>,\s]+\.)?([A-Za-z_]\w*)\s*\(/);
     // val/var name: Type?
     const propMatch = line.match(/\b(?:val|var)\s+([A-Za-z_]\w*)\s*:\s*[\w.<>,\s]+\?/);
 
@@ -121,6 +121,8 @@ function buildTarget(javaPath: string, kotlinPath: string, addedLines: string[])
  * Scans a unified diff for Java→Kotlin file migrations:
  *  - Foo.java deleted + Foo.kt added (matched by basename)
  *  - Foo.java renamed to Foo.kt (single block, old/new both present)
+ *  - Foo.java deleted + Bar.kt added, when they're the only unmatched
+ *    delete/add left (class renamed as part of the migration)
  * and pulls the public symbols (functions, nullable properties) the Kotlin
  * side newly exposes, so callers elsewhere in the repo can be checked against
  * them even though those call sites never show up in the diff itself.
@@ -156,6 +158,19 @@ export function detectJavaToKotlinMigrations(diff: string): MigrationTarget[] {
     targets.push(buildTarget(javaPath, addition.newPath!, addition.addedLines));
   }
 
+  // Fallback: a migration that also renames the class won't share a basename
+  // (git also won't detect it as a rename, since Java/Kotlin syntax differs
+  // too much for its similarity heuristic). If exactly one .java deletion and
+  // one .kt addition are left unmatched, they're almost certainly the same
+  // migration — pair them rather than silently dropping the migration.
+  const leftoverDeletions = deletions.filter((d) => !targets.some((t) => t.javaPath === d.oldPath));
+  const leftoverAdditions = additions.filter((a) => !usedAdditions.has(a));
+  if (leftoverDeletions.length === 1 && leftoverAdditions.length === 1) {
+    const javaPath = leftoverDeletions[0].oldPath!;
+    const addition = leftoverAdditions[0];
+    targets.push(buildTarget(javaPath, addition.newPath!, addition.addedLines));
+  }
+
   return targets.slice(0, MAX_FILES);
 }
 
@@ -165,8 +180,9 @@ function gitGrep(repoPath: string, baseRef: string, symbol: string, excludePaths
     repoPath,
     "grep",
     "-n",
+    "-w",
     "-E",
-    `(\\.|\\b)${symbol}\\s*(\\(|[^\\w(])`,
+    symbol,
     baseRef,
     "--",
     "*.kt",
@@ -242,20 +258,32 @@ export function buildCallerContext(
   const fileCache = new Map<string, string[] | undefined>();
   const sections: string[] = [];
   let totalHits = 0;
+  let truncated = false;
 
   for (const target of targets) {
-    if (totalHits >= MAX_TOTAL_HITS) break;
+    if (totalHits >= MAX_TOTAL_HITS) {
+      truncated = true;
+      break;
+    }
     const excludePaths = [target.javaPath, target.kotlinPath];
     const symbolBlocks: string[] = [];
 
     for (const symbol of target.symbols) {
-      if (totalHits >= MAX_TOTAL_HITS) break;
+      if (totalHits >= MAX_TOTAL_HITS) {
+        truncated = true;
+        break;
+      }
       const hits = gitGrep(repoPath, baseRef, symbol, excludePaths);
       if (hits.length === 0) continue;
+      if (hits.length > MAX_HITS_PER_SYMBOL) truncated = true;
 
       const snippets: string[] = [];
       for (const hit of hits) {
-        if (snippets.length >= MAX_HITS_PER_SYMBOL || totalHits >= MAX_TOTAL_HITS) break;
+        if (snippets.length >= MAX_HITS_PER_SYMBOL) break;
+        if (totalHits >= MAX_TOTAL_HITS) {
+          truncated = true;
+          break;
+        }
         const parsed = parseGrepHit(hit, baseRef);
         if (!parsed) continue;
         const lines = getFileLines(repoPath, baseRef, parsed.path, fileCache);
@@ -266,7 +294,8 @@ export function buildCallerContext(
         totalHits++;
       }
       if (snippets.length > 0) {
-        symbolBlocks.push(`**${symbol} 사용처:**\n\n${snippets.join("\n\n")}`);
+        const shown = hits.length > snippets.length ? ` (${snippets.length}/${hits.length}건 표시)` : "";
+        symbolBlocks.push(`**${symbol} 사용처${shown}:**\n\n${snippets.join("\n\n")}`);
       }
     }
 
@@ -280,10 +309,14 @@ export function buildCallerContext(
 
   if (sections.length === 0) return "";
 
+  const truncationNote = truncated
+    ? "\n\n⚠️ 호출처가 많아 일부만 표시했습니다. 아래 스니펫은 전체 호출부의 일부일 수 있으니, 실제 영향 범위는 base 브랜치에서 직접 검색해 확인하세요."
+    : "";
+
   return [
     "## Java→Kotlin 마이그레이션: 호출처 컨텍스트",
     "",
-    "이 PR은 아래 클래스를 Java에서 Kotlin으로 마이그레이션합니다. base 브랜치 기준으로 이 클래스를 호출하는 코드를 찾아 스니펫으로 표시했습니다(diff에는 포함되지 않음). 시그니처 변경, 특히 nullable 여부가 호출부의 방어 코드(null 체크 등)와 맞는지 확인하세요.",
+    `이 PR은 아래 클래스를 Java에서 Kotlin으로 마이그레이션합니다. base 브랜치 기준으로 이 클래스를 호출하는 코드를 찾아 스니펫으로 표시했습니다(diff에는 포함되지 않음). 시그니처 변경, 특히 nullable 여부가 호출부의 방어 코드(null 체크 등)와 맞는지 확인하세요.${truncationNote}`,
     "",
     ...sections,
   ].join("\n");

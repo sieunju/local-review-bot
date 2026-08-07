@@ -211,8 +211,8 @@ function readIfExists(fileName: string): string {
 }
 
 function loadReviewGuide(stack: string): string {
-  const guideFile = stack === "android" ? "CLAUDE.md" : `CLAUDE_${stack.toUpperCase()}.md`;
-  const referenceFile = stack === "android" ? "REFERENCE.md" : `REFERENCE_${stack.toUpperCase()}.md`;
+  const guideFile = `CLAUDE_${stack.toUpperCase()}.md`;
+  const referenceFile = `REFERENCE_${stack.toUpperCase()}.md`;
   const guide = readIfExists(guideFile);
   const reference = readIfExists(referenceFile);
   return reference ? `${guide}\n\n---\n\n${reference}` : guide;

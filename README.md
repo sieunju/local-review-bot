@@ -22,7 +22,7 @@ cp .env.example .env
 cp settings.example.json settings.json
 ```
 
-`.env`와 `settings.json`을 실제 값으로 채웁니다. 저장소/폴링 설정은 `.env`, LLM 접속 정보는 `settings.json`에 둡니다.
+`.env`와 `settings.json`을 실제 값으로 채웁니다. 저장소/폴링 설정은 `.env`, LLM 접속 정보와 리뷰 시간대는 `settings.json`에 둡니다.
 
 | 변수                       | 설명                                                                                                |
 | -------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -47,7 +47,8 @@ cp settings.example.json settings.json
     "model": "qwen2.5-coder:14b",
     "temperature": 0.2,
     "timeoutMs": 1200000
-  }
+  },
+  "reviewHours": { "start": "09:00", "end": "18:00" }
 }
 ```
 
@@ -58,6 +59,7 @@ cp settings.example.json settings.json
 | `llm.model`         | (필수) 사용할 모델명                                                                              |
 | `llm.temperature`   | 생성 temperature, 기본 0.2                                                                        |
 | `llm.timeoutMs`     | LLM 요청 fetch 타임아웃(ms), 기본 1200000(20분). 프롬프트가 크거나 모델이 느리면 Node 기본 타임아웃(5분)에 걸려 `HeadersTimeoutError`가 날 수 있어 넉넉히 잡음 |
+| `reviewHours`       | 폴링 실행 시 리뷰를 도는 시간대 (로컬 시간, `HH:MM`). `start` 이상 `end` 미만일 때만 리뷰하고 그 외에는 건너뜀. `start`가 `end`보다 늦으면 자정을 넘기는 시간대(예: `22:00`~`06:00`)로 처리. 생략하면 24시간 동작. `npm run review:once`는 시간대와 무관하게 실행 |
 
 `settings.json`은 API Key가 들어가므로 `.gitignore`에 등록되어 있습니다.
 
@@ -80,8 +82,8 @@ REPOS=[
 ```bash
 npm install
 cp .env.example .env                      # 저장소/토큰/폴링 주기
-cp settings.example.json settings.json    # LLM API 주소·API Key
-npm run review:once   # 단발 실행
+cp settings.example.json settings.json    # LLM API 주소·API Key, 리뷰 시간대
+npm run review:once   # 단발 실행 (리뷰 시간대 무시)
 npm run dev            # 폴링 실행 (REVIEW_INTERVAL마다 반복)
 npm run build && npm start   # 빌드 후 실행
 ```

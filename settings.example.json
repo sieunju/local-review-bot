@@ -5,5 +5,9 @@
     "model": "qwen2.5-coder:14b",
     "temperature": 0.2,
     "timeoutMs": 1200000
+  },
+  "reviewHours": {
+    "start": "09:00",
+    "end": "18:00"
   }
 }

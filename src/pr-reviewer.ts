@@ -16,6 +16,9 @@ interface Settings {
     temperature?: number;
     timeoutMs?: number;
   };
+  // Local-time window in which the polling loop reviews PRs, "HH:MM" each.
+  // Omit to review around the clock. start > end means an overnight window.
+  reviewHours?: { start: string; end: string };
 }
 
 function loadSettings(): Settings {
@@ -96,6 +99,27 @@ const REPO_PATHS: Record<string, string> = process.env.REPO_PATHS
   ? JSON.parse(process.env.REPO_PATHS)
   : {};
 const FALLBACK_BASE_REF = process.env.BASE_REF ?? "origin/develop";
+
+function parseClock(value: string): number {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value);
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
+    throw new Error(`settings.json reviewHours 값이 잘못됐습니다: "${value}" (HH:MM 형식)`);
+  }
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+const REVIEW_HOURS = settings.reviewHours
+  ? { start: parseClock(settings.reviewHours.start), end: parseClock(settings.reviewHours.end) }
+  : undefined;
+
+function isWithinReviewHours(now: Date): boolean {
+  if (!REVIEW_HOURS) {
+    return true;
+  }
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  const { start, end } = REVIEW_HOURS;
+  return start <= end ? minutes >= start && minutes < end : minutes >= start || minutes < end;
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -455,15 +479,29 @@ async function main(): Promise<void> {
   console.log("🚀 PR 리뷰 에이전트 시작");
   if (!once) {
     console.log(`⏰ 체크 간격: ${REVIEW_INTERVAL}초`);
+    if (settings.reviewHours) {
+      console.log(`🕘 리뷰 시간대: ${settings.reviewHours.start} ~ ${settings.reviewHours.end}`);
+    }
   }
 
-  await reviewOpenPullRequests();
-
-  if (!once) {
-    setInterval(() => {
-      reviewOpenPullRequests().catch((err) => console.error(err));
-    }, REVIEW_INTERVAL * 1000);
+  // --once is a manual run, so it ignores the review-hours window.
+  if (once) {
+    await reviewOpenPullRequests();
+    return;
   }
+
+  const tick = async (): Promise<void> => {
+    if (!isWithinReviewHours(new Date())) {
+      console.log(`💤 [${new Date().toLocaleTimeString()}] 리뷰 시간대가 아니라 건너뜀`);
+      return;
+    }
+    await reviewOpenPullRequests();
+  };
+
+  await tick();
+  setInterval(() => {
+    tick().catch((err) => console.error(err));
+  }, REVIEW_INTERVAL * 1000);
 }
 
 main().catch((err) => {

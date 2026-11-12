@@ -132,7 +132,27 @@ npm run build && npm start   # 빌드 후 실행
 
 ## 인라인 리뷰 코멘트
 
-리뷰는 PR 전체에 대한 코멘트 하나가 아니라, LLM이 `{summary, comments: [{file, line, body}]}` 형태의 JSON으로 응답하면 실제 diff의 해당 줄에 인라인 코멘트로 등록됩니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
+리뷰는 PR 전체에 대한 코멘트 하나가 아니라, LLM이 JSON으로 응답한 지적 사항을 실제 diff의 해당 줄에 인라인 코멘트로 등록합니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 응답 형식은 `{summary, comments: [{file, line, code, body}]}`이고, 가이드 파일이 자체 `{"findings": [...]}` 형식을 정의하면(예: [CLAUDE_ANDROID.md](CLAUDE_ANDROID.md)) 그 형식을 씁니다. 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
+
+### 코드 스니펫 표시
+
+각 코멘트는 문제가 되는 코드를 먼저 보여주고 그 아래에 설명을 답니다:
+
+````markdown
+```kotlin
+GlobalScope.launch {
+    repo.load(x)
+}
+```
+`app/Foo.kt:13-15`
+
+**[MUST]** GlobalScope 사용 ...
+````
+
+- 모델에게 문제 코드 2~6줄을 diff에서 그대로 복사해 `code`로 달라고 시키고, 봇이 그 코드를 diff에서 찾아 **diff 원문**으로 스니펫을 만듭니다 (최대 6줄, 1줄이면 위아래 1줄씩 문맥 추가).
+- 로컬 모델은 줄 번호 계산을 자주 틀리므로, 인용한 코드가 발견된 위치로 코멘트 줄 번호를 다시 맞춥니다. 코멘트가 엉뚱한 줄에 달리더라도 스니펫과 `파일:줄` 표기로 위치를 알 수 있습니다.
+- 인용한 코드도, 줄 번호도 diff에 없는 지적은 모델이 지어낸 것으로 보고 등록하지 않습니다 (경고 로그만 남김).
+- 코드 블록 언어는 파일 확장자로 정합니다 (`.kt` → `kotlin`, `.java` → `java` 등).
 
 ## Java→Kotlin 마이그레이션 리뷰
 

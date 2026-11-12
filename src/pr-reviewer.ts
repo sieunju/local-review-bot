@@ -331,6 +331,13 @@ interface ParsedReview {
   comments: InlineComment[];
 }
 
+// A comment as parsed from the LLM, before the code snippet is attached.
+interface DraftComment extends InlineComment {
+  code?: string;
+}
+
+const CODE_INSTRUCTIONS = `Every item must also include "code": the 2-6 consecutive lines of the problematic code, copied character-for-character from the diff's + lines (without the leading "+"), with "\\n" between lines. It must contain the line that "line" points to. Do not paraphrase, reformat or shorten the code.`;
+
 const LINE_NUMBER_INSTRUCTIONS = `"line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Calculate it from the hunk header "@@ -oldStart,oldCount +newStart,newCount @@": newStart + L, where L is the number of lines (added AND unchanged context lines, but NOT removed "-" lines) counted from the first line after that header down to the line you want to comment on (the first line after the header is L=0). Recompute newStart from each new "@@" header you cross. Omit comments you are not confident about the line number for.`;
 
 const REVIEW_JSON_INSTRUCTIONS = `
@@ -338,10 +345,11 @@ Respond with ONLY valid JSON (no markdown fences, no extra text) in this exact s
 {
   "summary": "one-line overall summary",
   "comments": [
-    { "file": "path/to/File.kt", "line": 42, "body": "review comment for this line" }
+    { "file": "path/to/File.kt", "line": 42, "code": "val user = repo.find(id)!!\\nshow(user.name)", "body": "review comment for this line" }
   ]
 }
 ${LINE_NUMBER_INSTRUCTIONS}
+${CODE_INSTRUCTIONS}
 IMPORTANT: write "summary" and every comment "body" in ${REVIEW_LANGUAGE_NAME}, regardless of what language the guide or diff above is in.
 `;
 
@@ -350,6 +358,7 @@ IMPORTANT: write "summary" and every comment "body" in ${REVIEW_LANGUAGE_NAME}, 
 const FINDINGS_JSON_INSTRUCTIONS = `
 Respond with ONLY valid JSON (no markdown fences, no extra text) in the {"findings":[...]} shape defined in the guide above.
 ${LINE_NUMBER_INSTRUCTIONS}
+${CODE_INSTRUCTIONS}
 IMPORTANT: write "reasoning", "issue" and "fix" in ${REVIEW_LANGUAGE_NAME}, regardless of what language the guide or diff above is in.
 `;
 
@@ -358,13 +367,14 @@ const MIN_FINDING_CONFIDENCE = 0.8;
 interface Finding {
   file: string;
   line: number;
+  code?: string;
   severity?: string;
   issue: string;
   fix?: string;
   confidence?: number;
 }
 
-function findingsToReview(findings: Finding[]): ParsedReview {
+function findingsToReview(findings: Finding[]): { summary: string; comments: DraftComment[] } {
   const kept = findings.filter((f) => (f.confidence ?? 1) >= MIN_FINDING_CONFIDENCE);
   const count = (severity: string) => kept.filter((f) => f.severity === severity).length;
   return {
@@ -372,17 +382,18 @@ function findingsToReview(findings: Finding[]): ParsedReview {
     comments: kept.map((f) => ({
       path: f.file,
       line: f.line,
+      code: f.code,
       body: `**[${f.severity ?? "SHOULD"}]** ${f.issue}` + (f.fix ? `\n\n**Fix:** ${f.fix}` : ""),
     })),
   };
 }
 
-function parseReview(raw: string): ParsedReview {
+function parseReview(raw: string): { summary: string; comments: DraftComment[] } {
   const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
   try {
     const parsed = JSON.parse(jsonText) as {
       summary?: string;
-      comments?: Array<{ file: string; line: number; body: string }>;
+      comments?: Array<{ file: string; line: number; code?: string; body: string }>;
       findings?: Finding[];
     };
     if (Array.isArray(parsed.findings)) {
@@ -393,12 +404,154 @@ function parseReview(raw: string): ParsedReview {
       comments: (parsed.comments ?? []).map((c) => ({
         path: c.file,
         line: c.line,
+        code: c.code,
         body: c.body,
       })),
     };
   } catch {
     return { summary: raw, comments: [] };
   }
+}
+
+const SNIPPET_MAX_LINES = 6;
+
+const FENCE_LANGUAGES: Record<string, string> = {
+  kt: "kotlin",
+  kts: "kotlin",
+  java: "java",
+  xml: "xml",
+  gradle: "groovy",
+  swift: "swift",
+  m: "objectivec",
+  h: "objectivec",
+  ts: "typescript",
+  tsx: "tsx",
+  js: "javascript",
+  jsx: "jsx",
+  vue: "vue",
+};
+
+interface DiffLine {
+  text: string;
+  added: boolean;
+}
+
+// file path -> (new-file line number -> line), for every added and context
+// line that appears in the diff.
+function parseDiffLines(diff: string): Map<string, Map<number, DiffLine>> {
+  const files = new Map<string, Map<number, DiffLine>>();
+  let current: Map<number, DiffLine> | undefined;
+  let newLine = 0;
+  let inHunk = false;
+  const useFile = (name: string): void => {
+    current = files.get(name) ?? new Map();
+    files.set(name, current);
+  };
+  for (const line of diff.split("\n")) {
+    const gitHeader = /^diff --git a\/.+ b\/(.+)$/.exec(line);
+    if (gitHeader) {
+      useFile(gitHeader[1]);
+      inHunk = false;
+      continue;
+    }
+    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(line);
+    if (hunk) {
+      newLine = Number(hunk[1]);
+      inHunk = true;
+      continue;
+    }
+    if (!inHunk) {
+      if (line.startsWith("+++ b/")) {
+        useFile(line.slice(6));
+      }
+      continue;
+    }
+    if (!current || line.startsWith("-") || line.startsWith("\\")) {
+      continue;
+    }
+    current.set(newLine, { text: line.slice(1), added: line.startsWith("+") });
+    newLine++;
+  }
+  return files;
+}
+
+// Finds where the code the LLM quoted really is in the diff, so the comment
+// lands on (and shows) the right lines even when the LLM's line number is off.
+// Returns the [start, end] new-file line range of the snippet to show.
+function locateSnippet(lines: Map<number, DiffLine>, comment: DraftComment): [number, number] | undefined {
+  const quoted = (comment.code ?? "")
+    .split("\n")
+    .map((l) => l.replace(/^\+/, "").trim())
+    .filter((l) => l.length > 0);
+  let start: number | undefined;
+  if (quoted.length > 0) {
+    for (const [lineNo, line] of lines) {
+      const closer = start === undefined || Math.abs(lineNo - comment.line) < Math.abs(start - comment.line);
+      if (line.added && line.text.trim() === quoted[0] && closer) {
+        start = lineNo;
+      }
+    }
+  }
+  let end: number;
+  if (start !== undefined) {
+    end = start + Math.min(quoted.length, SNIPPET_MAX_LINES) - 1;
+  } else if (lines.has(comment.line)) {
+    start = end = comment.line;
+  } else {
+    return undefined;
+  }
+  // A single line alone is hard to place — show one line of context each side.
+  if (start === end) {
+    start--;
+    end++;
+  }
+  while (!lines.has(start) && start < end) start++;
+  while (!lines.has(end) && end > start) end--;
+  for (let n = start; n <= end; n++) {
+    if (!lines.has(n)) {
+      end = n - 1;
+    }
+  }
+  return [start, end];
+}
+
+// Prefixes each comment body with a fenced snippet of the offending code,
+// taken from the diff itself, and re-anchors the comment line onto it.
+function attachSnippets(review: { summary: string; comments: DraftComment[] }, diff: string): ParsedReview {
+  const files = parseDiffLines(diff);
+  const comments: InlineComment[] = [];
+  for (const { code, ...comment } of review.comments) {
+    const lines = files.get(comment.path);
+    const range = lines && locateSnippet(lines, { ...comment, code });
+    const language = FENCE_LANGUAGES[comment.path.split(".").pop() ?? ""] ?? "";
+    if (!lines || !range) {
+      // Neither the quoted code nor the line exists in the diff: there is
+      // nowhere valid to put this comment, and it is likely hallucinated.
+      console.warn(`⚠️  diff에서 위치를 찾지 못해 코멘트 제외: ${comment.path}:${comment.line}`);
+      continue;
+    }
+    const [start, end] = range;
+    const snippet: string[] = [];
+    for (let n = start; n <= end; n++) {
+      snippet.push(lines.get(n)!.text);
+    }
+    const indent = Math.min(...snippet.filter((l) => l.trim()).map((l) => l.length - l.trimStart().length));
+    const location = start === end ? `${start}` : `${start}-${end}`;
+    // Keep the LLM's line if it's inside the snippet; otherwise it was wrong.
+    const preferred = comment.line >= start && comment.line <= end ? comment.line : start;
+    // Inline comments can only sit on added lines.
+    const inRange = Array.from({ length: end - start + 1 }, (_, i) => start + i);
+    const line =
+      [...inRange.filter((n) => n >= preferred), ...inRange].find((n) => lines.get(n)!.added) ?? preferred;
+    comments.push({
+      ...comment,
+      line,
+      body:
+        `\`\`\`${language}\n${snippet.map((l) => l.slice(indent)).join("\n")}\n\`\`\`\n` +
+        `\`${comment.path}:${location}\`\n\n${comment.body}`,
+    });
+  }
+  return { summary: review.summary, comments };
 }
 
 async function generateReview(diff: string, stack: string, callerContext: string): Promise<ParsedReview> {
@@ -457,7 +610,7 @@ async function generateReview(diff: string, stack: string, callerContext: string
   if (typeof data.usage?.prompt_tokens === "number") {
     console.log(`📊 prompt tokens: ${data.usage.prompt_tokens}`);
   }
-  return parseReview(content);
+  return attachSnippets(parseReview(content), diff);
 }
 
 async function reviewProject(project: Project): Promise<void> {

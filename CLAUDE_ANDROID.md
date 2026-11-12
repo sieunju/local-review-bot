@@ -33,6 +33,7 @@ P4 Architecture
 {"findings":[{
   "reasoning": "cite the exact added line(s) and explain how it fails",
   "file": "path", "line": <new-file line number>,
+  "code": "the 2-6 problematic lines copied verbatim from the diff, joined with \\n",
   "severity": "MUST|SHOULD",
   "category": "security|lifecycle|concurrency|null|compose|architecture",
   "issue": "one sentence", "fix": "one sentence",

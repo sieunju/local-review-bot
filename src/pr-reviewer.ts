@@ -19,6 +19,13 @@ interface Settings {
   // Local-time window in which the polling loop reviews PRs, "HH:MM" each.
   // Omit to review around the clock. start > end means an overnight window.
   reviewHours?: { start: string; end: string };
+  trigger?: {
+    // "auto" (default): review every open PR. "manual": review a PR only
+    // when someone comments the command on it.
+    mode?: "auto" | "manual";
+    // First word of the comment's first line, default "@review-bot".
+    command?: string;
+  };
 }
 
 function loadSettings(): Settings {
@@ -34,6 +41,11 @@ function loadSettings(): Settings {
 }
 
 const settings = loadSettings();
+const TRIGGER_MODE = settings.trigger?.mode ?? "auto";
+const TRIGGER_COMMAND = settings.trigger?.command ?? "@review-bot";
+if (TRIGGER_MODE !== "auto" && TRIGGER_MODE !== "manual") {
+  throw new Error(`settings.json trigger.mode 값이 잘못됐습니다: "${TRIGGER_MODE}" (auto | manual)`);
+}
 
 // Node's built-in fetch is undici under the hood, and defaults to a 300s
 // headersTimeout/bodyTimeout. generateReview() calls the LLM with
@@ -176,6 +188,55 @@ db.exec(`
     PRIMARY KEY (project, comment_id)
   )
 `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pr_triggers (
+    project TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    last_comment_id INTEGER NOT NULL,
+    PRIMARY KEY (project, pr_number)
+  )
+`);
+db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+
+// Manual mode only reacts to commands commented after the bot was first
+// started in manual mode, so old comments on existing PRs don't fire.
+function getManualStartedAt(): number {
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'manual_started_at'").get() as
+    | { value: string }
+    | undefined;
+  if (row) {
+    return Date.parse(row.value);
+  }
+  const now = new Date();
+  db.prepare("INSERT INTO meta (key, value) VALUES ('manual_started_at', ?)").run(now.toISOString());
+  return now.getTime();
+}
+const MANUAL_STARTED_AT = TRIGGER_MODE === "manual" ? getManualStartedAt() : 0;
+
+function isTriggerCommand(body: string): boolean {
+  const firstLine = body.trim().split("\n")[0] ?? "";
+  return firstLine.trim().split(/\s+/)[0] === TRIGGER_COMMAND;
+}
+
+// Returns true if a new, not-yet-handled command comment exists on the PR.
+// The high-water mark is saved before the review runs, so a crash mid-review
+// doesn't re-run the same command on restart.
+async function consumeTrigger(project: Project, prNumber: number): Promise<boolean> {
+  const row = db
+    .prepare("SELECT last_comment_id FROM pr_triggers WHERE project = ? AND pr_number = ?")
+    .get(project.label, prNumber) as { last_comment_id: number } | undefined;
+  const lastSeen = row?.last_comment_id ?? 0;
+  const fresh = (await project.provider.fetchComments(prNumber)).filter(
+    (c) => c.id > lastSeen && Date.parse(c.createdAt) >= MANUAL_STARTED_AT
+  );
+  if (fresh.length === 0) {
+    return false;
+  }
+  db.prepare(
+    "INSERT OR REPLACE INTO pr_triggers (project, pr_number, last_comment_id) VALUES (?, ?, ?)"
+  ).run(project.label, prNumber, Math.max(...fresh.map((c) => c.id)));
+  return fresh.some((c) => isTriggerCommand(c.body));
+}
 
 const projects: Project[] = loadProjects().map((cfg) => {
   const provider = cfg.provider.toLowerCase();
@@ -405,8 +466,15 @@ async function reviewProject(project: Project): Promise<void> {
   console.log(`\n📋 [${new Date().toLocaleTimeString()}] [${label}] 오픈 PR 확인: ${prs.length}개`);
 
   for (const pr of prs) {
+    if (TRIGGER_MODE === "manual") {
+      if (!(await consumeTrigger(project, pr.number))) {
+        continue;
+      }
+      console.log(`💬 [${label}] PR #${pr.number}: ${TRIGGER_COMMAND} 명령 감지`);
+    }
     const refs = await provider.fetchDiffRefs(pr.number);
-    if (isAlreadyReviewed(label, pr.number, refs.headSha)) {
+    // A manual command always re-reviews, even if the head commit is unchanged.
+    if (TRIGGER_MODE === "auto" && isAlreadyReviewed(label, pr.number, refs.headSha)) {
       console.log(`⏭️  [${label}] PR #${pr.number}: 이미 리뷰됨 (변경 없음)`);
       continue;
     }
@@ -479,6 +547,11 @@ async function main(): Promise<void> {
   console.log("🚀 PR 리뷰 에이전트 시작");
   if (!once) {
     console.log(`⏰ 체크 간격: ${REVIEW_INTERVAL}초`);
+    console.log(
+      TRIGGER_MODE === "manual"
+        ? `🎯 수동 모드: PR에 "${TRIGGER_COMMAND}" 코멘트가 달리면 리뷰`
+        : "🎯 자동 모드: 오픈 PR 전부 리뷰"
+    );
     if (settings.reviewHours) {
       console.log(`🕘 리뷰 시간대: ${settings.reviewHours.start} ~ ${settings.reviewHours.end}`);
     }

@@ -9,5 +9,9 @@
   "reviewHours": {
     "start": "09:00",
     "end": "18:00"
+  },
+  "trigger": {
+    "mode": "auto",
+    "command": "@review-bot"
   }
 }

@@ -48,7 +48,8 @@ cp settings.example.json settings.json
     "temperature": 0.2,
     "timeoutMs": 1200000
   },
-  "reviewHours": { "start": "09:00", "end": "18:00" }
+  "reviewHours": { "start": "09:00", "end": "18:00" },
+  "trigger": { "mode": "auto", "command": "@review-bot" }
 }
 ```
 
@@ -60,6 +61,8 @@ cp settings.example.json settings.json
 | `llm.temperature`   | 생성 temperature, 기본 0.2                                                                        |
 | `llm.timeoutMs`     | LLM 요청 fetch 타임아웃(ms), 기본 1200000(20분). 프롬프트가 크거나 모델이 느리면 Node 기본 타임아웃(5분)에 걸려 `HeadersTimeoutError`가 날 수 있어 넉넉히 잡음 |
 | `reviewHours`       | 폴링 실행 시 리뷰를 도는 시간대 (로컬 시간, `HH:MM`). `start` 이상 `end` 미만일 때만 리뷰하고 그 외에는 건너뜀. `start`가 `end`보다 늦으면 자정을 넘기는 시간대(예: `22:00`~`06:00`)로 처리. 생략하면 24시간 동작. `npm run review:once`는 시간대와 무관하게 실행 |
+| `trigger.mode`      | `auto`(기본): 오픈 PR을 전부 리뷰. `manual`: PR에 명령어 코멘트가 달렸을 때만 리뷰 (아래 [리뷰 방식](#리뷰-방식-자동--수동) 참고) |
+| `trigger.command`   | 수동 모드에서 쓰는 명령어, 기본 `@review-bot`                                                     |
 
 `settings.json`은 API Key가 들어가므로 `.gitignore`에 등록되어 있습니다.
 
@@ -82,11 +85,29 @@ REPOS=[
 ```bash
 npm install
 cp .env.example .env                      # 저장소/토큰/폴링 주기
-cp settings.example.json settings.json    # LLM API 주소·API Key, 리뷰 시간대
+cp settings.example.json settings.json    # LLM API 주소·API Key, 리뷰 시간대, 리뷰 방식
 npm run review:once   # 단발 실행 (리뷰 시간대 무시)
 npm run dev            # 폴링 실행 (REVIEW_INTERVAL마다 반복)
 npm run build && npm start   # 빌드 후 실행
 ```
+
+## 리뷰 방식 (자동 / 수동)
+
+`settings.json`의 `trigger.mode`로 고릅니다.
+
+- **자동 (`auto`, 기본)**: 폴링할 때마다 오픈 PR을 전부 확인하고, 아직 리뷰하지 않았거나 새 커밋이 올라온 PR을 리뷰합니다.
+- **수동 (`manual`)**: PR에 `@review-bot` 코멘트를 달았을 때만 그 PR을 리뷰합니다.
+
+수동 모드 사용법:
+
+1. `settings.json`에 `"trigger": { "mode": "manual" }`을 넣고 `npm run dev`로 봇을 띄웁니다.
+2. 리뷰받고 싶은 PR에 일반 코멘트로 `@review-bot`을 답니다. 코멘트 **첫 줄의 첫 단어**가 명령어여야 인식합니다 (`@review-bot 부탁해요`는 되고, `리뷰 좀 @review-bot`은 안 됨).
+3. 다음 폴링(`REVIEW_INTERVAL`초 이내, 리뷰 시간대 안일 때)에 봇이 명령을 감지하고 리뷰를 답니다.
+
+- 같은 커밋이라도 명령을 다시 달면 다시 리뷰합니다.
+- 봇을 수동 모드로 처음 띄운 시각 이전에 달린 코멘트는 무시합니다.
+- 한 번 처리한 명령은 봇을 재시작해도 다시 실행하지 않습니다. `npm run db:reset`을 하면 이 기록도 초기화됩니다.
+- 명령어는 `trigger.command`로 바꿀 수 있습니다.
 
 `npm run dev`는 포그라운드에서 `REVIEW_INTERVAL`마다 계속 폴링하는 프로세스입니다. 종료하려면:
 

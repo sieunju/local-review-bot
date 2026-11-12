@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import { Agent, setGlobalDispatcher } from "undici";
 import { createGitProvider, DiffRefs, GitProvider, InlineComment, PostedComment, ProjectConfig } from "./providers";
 import { buildCallerContext, detectJavaToKotlinMigrations } from "./migration-context";
+import { annotateDiff, normalizeCode, quotedLines, resolveLine, splitDiffByFile } from "./diff-lines";
 
 interface Settings {
   llm: {
@@ -336,9 +337,9 @@ interface DraftComment extends InlineComment {
   code?: string;
 }
 
-const CODE_INSTRUCTIONS = `Every item must also include "code": the 2-6 consecutive lines of the problematic code, copied character-for-character from the diff's + lines (without the leading "+"), with "\\n" between lines. It must contain the line that "line" points to. Do not paraphrase, reformat or shorten the code.`;
+const CODE_INSTRUCTIONS = `Every item must also include "code": the 2-6 consecutive lines of the problematic code, copied character-for-character from the diff's added lines (without the "L<number> +" prefix), with "\\n" between lines. It must contain the line that "line" points to. Do not paraphrase, reformat or shorten the code.`;
 
-const LINE_NUMBER_INSTRUCTIONS = `"line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Calculate it from the hunk header "@@ -oldStart,oldCount +newStart,newCount @@": newStart + L, where L is the number of lines (added AND unchanged context lines, but NOT removed "-" lines) counted from the first line after that header down to the line you want to comment on (the first line after the header is L=0). Recompute newStart from each new "@@" header you cross. Omit comments you are not confident about the line number for.`;
+const LINE_NUMBER_INSTRUCTIONS = `Each line is prefixed with its new-file line number (e.g. \`L42 + code\`). Copy the line number from the prefix. Never compute or guess it. Added lines look like \`L42 + code\`, unchanged context lines like \`L42   code\`, and removed lines have no number. "line" must be the number from the prefix of an added line.`;
 
 const REVIEW_JSON_INSTRUCTIONS = `
 Respond with ONLY valid JSON (no markdown fences, no extra text) in this exact shape:
@@ -431,118 +432,55 @@ const FENCE_LANGUAGES: Record<string, string> = {
   vue: "vue",
 };
 
-interface DiffLine {
-  text: string;
-  added: boolean;
-}
-
-// file path -> (new-file line number -> line), for every added and context
-// line that appears in the diff.
-function parseDiffLines(diff: string): Map<string, Map<number, DiffLine>> {
-  const files = new Map<string, Map<number, DiffLine>>();
-  let current: Map<number, DiffLine> | undefined;
-  let newLine = 0;
-  let inHunk = false;
-  const useFile = (name: string): void => {
-    current = files.get(name) ?? new Map();
-    files.set(name, current);
-  };
-  for (const line of diff.split("\n")) {
-    const gitHeader = /^diff --git a\/.+ b\/(.+)$/.exec(line);
-    if (gitHeader) {
-      useFile(gitHeader[1]);
-      inHunk = false;
-      continue;
-    }
-    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(line);
-    if (hunk) {
-      newLine = Number(hunk[1]);
-      inHunk = true;
-      continue;
-    }
-    if (!inHunk) {
-      if (line.startsWith("+++ b/")) {
-        useFile(line.slice(6));
-      }
-      continue;
-    }
-    if (!current || line.startsWith("-") || line.startsWith("\\")) {
-      continue;
-    }
-    current.set(newLine, { text: line.slice(1), added: line.startsWith("+") });
-    newLine++;
-  }
-  return files;
-}
-
-// Finds where the code the LLM quoted really is in the diff, so the comment
-// lands on (and shows) the right lines even when the LLM's line number is off.
-// Returns the [start, end] new-file line range of the snippet to show.
-function locateSnippet(lines: Map<number, DiffLine>, comment: DraftComment): [number, number] | undefined {
-  const quoted = (comment.code ?? "")
-    .split("\n")
-    .map((l) => l.replace(/^\+/, "").trim())
-    .filter((l) => l.length > 0);
-  let start: number | undefined;
-  if (quoted.length > 0) {
-    for (const [lineNo, line] of lines) {
-      const closer = start === undefined || Math.abs(lineNo - comment.line) < Math.abs(start - comment.line);
-      if (line.added && line.text.trim() === quoted[0] && closer) {
-        start = lineNo;
-      }
-    }
-  }
-  let end: number;
-  if (start !== undefined) {
-    end = start + Math.min(quoted.length, SNIPPET_MAX_LINES) - 1;
-  } else if (lines.has(comment.line)) {
-    start = end = comment.line;
-  } else {
-    return undefined;
-  }
+// Picks the [start, end] new-file line range to show for a comment anchored
+// at `line`: the quoted block around it (up to SNIPPET_MAX_LINES), limited to
+// lines that are contiguous in the diff.
+function snippetRange(lines: Map<number, string>, line: number, code: string | undefined): [number, number] {
+  const quoted = quotedLines(code);
+  const offset = Math.max(0, quoted.indexOf(normalizeCode(lines.get(line) ?? "")));
+  let start = line - Math.min(offset, SNIPPET_MAX_LINES - 1);
+  let end = start + Math.min(Math.max(quoted.length, 1), SNIPPET_MAX_LINES) - 1;
   // A single line alone is hard to place — show one line of context each side.
   if (start === end) {
     start--;
     end++;
   }
-  while (!lines.has(start) && start < end) start++;
-  while (!lines.has(end) && end > start) end--;
-  for (let n = start; n <= end; n++) {
-    if (!lines.has(n)) {
-      end = n - 1;
-    }
-  }
-  return [start, end];
+  let from = line;
+  let to = line;
+  while (from > start && lines.has(from - 1)) from--;
+  while (to < end && lines.has(to + 1)) to++;
+  return [from, to];
 }
 
-// Prefixes each comment body with a fenced snippet of the offending code,
-// taken from the diff itself, and re-anchors the comment line onto it.
+// Verifies each comment's line against the code the LLM quoted (correcting
+// it when the code is found elsewhere), prefixes the body with a fenced
+// snippet taken from the diff itself, and moves comments that can't be
+// placed on an added line into the summary.
 function attachSnippets(review: { summary: string; comments: DraftComment[] }, diff: string): ParsedReview {
-  const files = parseDiffLines(diff);
+  const patches = splitDiffByFile(diff);
   const comments: InlineComment[] = [];
+  let summary = review.summary;
   for (const { code, ...comment } of review.comments) {
-    const lines = files.get(comment.path);
-    const range = lines && locateSnippet(lines, { ...comment, code });
-    const language = FENCE_LANGUAGES[comment.path.split(".").pop() ?? ""] ?? "";
-    if (!lines || !range) {
-      // Neither the quoted code nor the line exists in the diff: there is
-      // nowhere valid to put this comment, and it is likely hallucinated.
-      console.warn(`⚠️  diff에서 위치를 찾지 못해 코멘트 제외: ${comment.path}:${comment.line}`);
+    const patch = patches.get(comment.path);
+    const file = patch === undefined ? undefined : annotateDiff(patch);
+    const line = file && resolveLine({ line: comment.line, code }, file.added);
+    if (!file || line === undefined) {
+      const reason = !file ? "diff에 없는 파일" : "code가 추가된 줄과 일치하지 않음";
+      console.warn(`⚠️  ${comment.path}:${comment.line} 인라인 불가 → 요약으로 이동 (${reason})`);
+      summary += `\n\n---\n\`${comment.path}\`\n\n${comment.body}`;
       continue;
     }
-    const [start, end] = range;
+    if (line !== comment.line) {
+      console.log(`🔧 ${comment.path}: 줄 번호 교정 ${comment.line} → ${line} (code 일치 위치 기준)`);
+    }
+    const [start, end] = snippetRange(file.lines, line, code);
     const snippet: string[] = [];
     for (let n = start; n <= end; n++) {
-      snippet.push(lines.get(n)!.text);
+      snippet.push(file.lines.get(n)!);
     }
     const indent = Math.min(...snippet.filter((l) => l.trim()).map((l) => l.length - l.trimStart().length));
     const location = start === end ? `${start}` : `${start}-${end}`;
-    // Keep the LLM's line if it's inside the snippet; otherwise it was wrong.
-    const preferred = comment.line >= start && comment.line <= end ? comment.line : start;
-    // Inline comments can only sit on added lines.
-    const inRange = Array.from({ length: end - start + 1 }, (_, i) => start + i);
-    const line =
-      [...inRange.filter((n) => n >= preferred), ...inRange].find((n) => lines.get(n)!.added) ?? preferred;
+    const language = FENCE_LANGUAGES[comment.path.split(".").pop() ?? ""] ?? "";
     comments.push({
       ...comment,
       line,
@@ -551,7 +489,7 @@ function attachSnippets(review: { summary: string; comments: DraftComment[] }, d
         `\`${comment.path}:${location}\`\n\n${comment.body}`,
     });
   }
-  return { summary: review.summary, comments };
+  return { summary, comments };
 }
 
 async function generateReview(diff: string, stack: string, callerContext: string): Promise<ParsedReview> {
@@ -572,9 +510,11 @@ async function generateReview(diff: string, stack: string, callerContext: string
     systemParts.push(REVIEW_JSON_INSTRUCTIONS);
   }
 
+  // The LLM sees every line prefixed with its new-file line number.
+  const numberedDiff = [...splitDiffByFile(diff).values()].map((patch) => annotateDiff(patch).text).join("\n");
   const userContent = callerContext
-    ? `${callerContext}\n\n=== DIFF (리뷰 대상 — 코멘트는 이 안의 파일/라인에만 달 수 있음) ===\n${diff}`
-    : `Review the following diff and leave concise, actionable feedback:\n\n${diff}`;
+    ? `${callerContext}\n\n=== DIFF (리뷰 대상 — 코멘트는 이 안의 파일/라인에만 달 수 있음) ===\n${numberedDiff}`
+    : `Review the following diff and leave concise, actionable feedback:\n\n${numberedDiff}`;
 
   const res = await fetch(`${LLM_API_URL}/chat/completions`, {
     method: "POST",

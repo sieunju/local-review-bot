@@ -7,7 +7,8 @@
     "build": "tsc",
     "start": "node dist/pr-reviewer.js",
     "review:once": "ts-node src/pr-reviewer.ts --once",
-    "db:reset": "rm -f pr-reviewer.db"
+    "db:reset": "rm -f pr-reviewer.db",
+    "test": "node --require ts-node/register --test test/*.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",

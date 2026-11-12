@@ -123,7 +123,10 @@ class GiteaProvider implements GitProvider {
           body: summary,
           comments: comments.map((c) => ({
             path: c.path,
+            // Gitea positions are real file line numbers; an added line
+            // has only a new-file position.
             new_position: c.line,
+            old_position: 0,
             body: c.body,
           })),
         }),

@@ -7,15 +7,40 @@ import { Agent, setGlobalDispatcher } from "undici";
 import { createGitProvider, DiffRefs, GitProvider, InlineComment, PostedComment, ProjectConfig } from "./providers";
 import { buildCallerContext, detectJavaToKotlinMigrations } from "./migration-context";
 
+interface Settings {
+  llm: {
+    // OpenAI-compatible base URL, e.g. "http://localhost:1234/v1"
+    apiUrl: string;
+    apiKey?: string;
+    model: string;
+    temperature?: number;
+    timeoutMs?: number;
+  };
+}
+
+function loadSettings(): Settings {
+  const settingsPath = path.join(process.cwd(), "settings.json");
+  if (!fs.existsSync(settingsPath)) {
+    throw new Error("settings.json이 없습니다. settings.example.json을 복사해서 만들어 주세요.");
+  }
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")) as Settings;
+  if (!settings.llm?.apiUrl || !settings.llm?.model) {
+    throw new Error("settings.json의 llm.apiUrl, llm.model은 필수입니다.");
+  }
+  return settings;
+}
+
+const settings = loadSettings();
+
 // Node's built-in fetch is undici under the hood, and defaults to a 300s
-// headersTimeout/bodyTimeout. generateReview() calls Ollama with
+// headersTimeout/bodyTimeout. generateReview() calls the LLM with
 // stream:false, so it sends nothing — not even response headers — until
-// generation is fully done. A large num_ctx (migration caller context can
+// generation is fully done. A large prompt (migration caller context can
 // add tens of thousands of chars) or a slow local model can push that past
-// 5 minutes, tripping undici's HeadersTimeoutError before Ollama ever gets
+// 5 minutes, tripping undici's HeadersTimeoutError before the LLM ever gets
 // to respond.
-const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS ?? 20 * 60_000);
-setGlobalDispatcher(new Agent({ headersTimeout: OLLAMA_TIMEOUT_MS, bodyTimeout: OLLAMA_TIMEOUT_MS }));
+const LLM_TIMEOUT_MS = settings.llm.timeoutMs ?? 20 * 60_000;
+setGlobalDispatcher(new Agent({ headersTimeout: LLM_TIMEOUT_MS, bodyTimeout: LLM_TIMEOUT_MS }));
 
 const DEFAULT_URLS: Record<string, string> = {
   gitea: "http://localhost:3000",
@@ -58,10 +83,8 @@ const STACK_LABELS: Record<string, string> = {
   web: "Web frontend",
 };
 
-const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
-const OLLAMA_NUM_CTX = Number(process.env.OLLAMA_NUM_CTX ?? 16384);
-const OLLAMA_TEMPERATURE = Number(process.env.OLLAMA_TEMPERATURE ?? 0.2);
+const LLM_API_URL = settings.llm.apiUrl.replace(/\/+$/, "");
+const LLM_TEMPERATURE = settings.llm.temperature ?? 0.2;
 const REVIEW_INTERVAL = Number(process.env.REVIEW_INTERVAL ?? 300);
 const REVIEW_LANGUAGE = process.env.REVIEW_LANGUAGE ?? "ko";
 const REVIEW_LANGUAGE_NAMES: Record<string, string> = { ko: "Korean (한국어)", en: "English", ja: "Japanese (日本語)" };
@@ -315,13 +338,16 @@ async function generateReview(diff: string, stack: string, callerContext: string
     ? `${callerContext}\n\n=== DIFF (리뷰 대상 — 코멘트는 이 안의 파일/라인에만 달 수 있음) ===\n${diff}`
     : `Review the following diff and leave concise, actionable feedback:\n\n${diff}`;
 
-  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+  const res = await fetch(`${LLM_API_URL}/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(settings.llm.apiKey ? { Authorization: `Bearer ${settings.llm.apiKey}` } : {}),
+    },
     body: JSON.stringify({
-      model: OLLAMA_MODEL,
+      model: settings.llm.model,
       stream: false,
-      options: { num_ctx: OLLAMA_NUM_CTX, temperature: OLLAMA_TEMPERATURE },
+      temperature: LLM_TEMPERATURE,
       messages: [
         {
           role: "system",
@@ -335,17 +361,18 @@ async function generateReview(diff: string, stack: string, callerContext: string
     }),
   });
   if (!res.ok) {
-    throw new Error(`Ollama API error: ${res.status}`);
+    throw new Error(`LLM API error: ${res.status}`);
   }
-  const data = (await res.json()) as { message: { content: string }; prompt_eval_count?: number };
-  console.log(`🤖 Ollama 응답:\n${data.message.content}`);
-  if (typeof data.prompt_eval_count === "number") {
-    console.log(`📊 prompt tokens: ${data.prompt_eval_count} / num_ctx ${OLLAMA_NUM_CTX}`);
-    if (data.prompt_eval_count > OLLAMA_NUM_CTX * 0.9) {
-      console.warn(`⚠️  prompt tokens가 num_ctx(${OLLAMA_NUM_CTX})의 90%를 넘었습니다 — 프롬프트가 잘렸을 수 있습니다.`);
-    }
+  const data = (await res.json()) as {
+    choices: Array<{ message: { content: string } }>;
+    usage?: { prompt_tokens?: number };
+  };
+  const content = data.choices[0].message.content;
+  console.log(`🤖 LLM 응답:\n${content}`);
+  if (typeof data.usage?.prompt_tokens === "number") {
+    console.log(`📊 prompt tokens: ${data.usage.prompt_tokens}`);
   }
-  return parseReview(data.message.content);
+  return parseReview(content);
 }
 
 async function reviewProject(project: Project): Promise<void> {

@@ -1,6 +1,6 @@
 # local-review-bot
 
-Gitea/GitHub/GitLab의 오픈 PR 중 Android(`.kt`, `.java`, `gradle`) / iOS(`.swift`, `.m`, `Podfile`) / Web(`.ts`, `.tsx`, `.js`, `.vue` 등) 관련 변경을 감지해 로컬 Ollama 모델로 자동 리뷰 댓글을 다는 봇. 저장소마다 스택을 다르게 지정할 수 있습니다.
+Gitea/GitHub/GitLab의 오픈 PR 중 Android(`.kt`, `.java`, `gradle`) / iOS(`.swift`, `.m`, `Podfile`) / Web(`.ts`, `.tsx`, `.js`, `.vue` 등) 관련 변경을 감지해 로컬 LLM(OpenAI 호환 API)으로 자동 리뷰 댓글을 다는 봇. 저장소마다 스택을 다르게 지정할 수 있습니다.
 
 ## 왜 폴링 방식인가
 
@@ -12,16 +12,17 @@ Gitea/GitHub/GitLab의 오픈 PR 중 Android(`.kt`, `.java`, `gradle`) / iOS(`.s
 
 ## 준비물
 
-- [Ollama](https://ollama.com) 설치 후 리뷰용 모델 pull (예: `ollama pull qwen2.5-coder:14b`)
+- OpenAI 호환 API(`/chat/completions`)를 제공하는 로컬 LLM 서버의 주소와 API Key
 - Git 호스팅 서버(Gitea/GitHub/GitLab)의 API 토큰
 
 ## 설정
 
 ```bash
 cp .env.example .env
+cp settings.example.json settings.json
 ```
 
-`.env`를 실제 값으로 채웁니다.
+`.env`와 `settings.json`을 실제 값으로 채웁니다. 저장소/폴링 설정은 `.env`, LLM 접속 정보는 `settings.json`에 둡니다.
 
 | 변수                       | 설명                                                                                                |
 | -------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -31,15 +32,34 @@ cp .env.example .env
 | `REPO_OWNER` / `REPO_NAME` | 저장소 소유자/이름                                                                                  |
 | `STACK`                    | 리뷰 페르소나. `android` \| `ios` \| `web`, 기본 `android` (저장소 1개만 볼 때)                     |
 | `REPOS`                    | 여러 저장소를 볼 때 쓰는 JSON 배열. 설정하면 위 5개는 무시됨 (아래 [여러 프로젝트 보기](#여러-프로젝트-보기) 참고) |
-| `OLLAMA_URL`               | 기본 `http://localhost:11434`                                                                       |
-| `OLLAMA_MODEL`             | 로컬에 pull 받은 모델명                                                                             |
-| `OLLAMA_NUM_CTX`           | Ollama 컨텍스트 윈도우 크기(토큰), 기본 16384. 생략하면 Ollama 기본값(4096)이 적용돼 가이드+diff가 길 때 프롬프트가 잘릴 수 있음 |
-| `OLLAMA_TEMPERATURE`       | Ollama 생성 temperature, 기본 0.2                                                                   |
-| `OLLAMA_TIMEOUT_MS`         | Ollama 요청 fetch 타임아웃(ms), 기본 1200000(20분). `num_ctx`가 크거나 로컬 모델이 느리면 Node 기본 타임아웃(5분)에 걸려 `HeadersTimeoutError`가 날 수 있어 넉넉히 잡음 |
 | `REVIEW_INTERVAL`          | 폴링 주기(초), 기본 300                                                                             |
 | `REVIEW_LANGUAGE`          | 리뷰 코멘트 작성 언어 (예: `ko`, `en`), 기본 `ko`                                                    |
 | `REPO_PATHS`                | Java→Kotlin 마이그레이션 리뷰용 `{"owner/repo": "로컬 클론 경로"}` JSON, 기본 `{}` (아래 [마이그레이션 리뷰](#javakotlin-마이그레이션-리뷰) 참고) |
 | `BASE_REF`                  | 위 기능에서 `DiffRefs`에 base sha가 없을 때 쓰는 폴백 base ref, 기본 `origin/develop`               |
+
+### settings.json
+
+```json
+{
+  "llm": {
+    "apiUrl": "http://localhost:1234/v1",
+    "apiKey": "<api key>",
+    "model": "qwen2.5-coder:14b",
+    "temperature": 0.2,
+    "timeoutMs": 1200000
+  }
+}
+```
+
+| 키                  | 설명                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
+| `llm.apiUrl`        | (필수) OpenAI 호환 API의 base URL. 여기에 `/chat/completions`를 붙여 호출                          |
+| `llm.apiKey`        | API Key. 있으면 `Authorization: Bearer <key>` 헤더로 전송, 생략 가능                               |
+| `llm.model`         | (필수) 사용할 모델명                                                                              |
+| `llm.temperature`   | 생성 temperature, 기본 0.2                                                                        |
+| `llm.timeoutMs`     | LLM 요청 fetch 타임아웃(ms), 기본 1200000(20분). 프롬프트가 크거나 모델이 느리면 Node 기본 타임아웃(5분)에 걸려 `HeadersTimeoutError`가 날 수 있어 넉넉히 잡음 |
+
+`settings.json`은 API Key가 들어가므로 `.gitignore`에 등록되어 있습니다.
 
 ### 여러 프로젝트 보기
 
@@ -59,6 +79,8 @@ REPOS=[
 
 ```bash
 npm install
+cp .env.example .env                      # 저장소/토큰/폴링 주기
+cp settings.example.json settings.json    # LLM API 주소·API Key
 npm run review:once   # 단발 실행
 npm run dev            # 폴링 실행 (REVIEW_INTERVAL마다 반복)
 npm run build && npm start   # 빌드 후 실행
@@ -87,7 +109,7 @@ npm run build && npm start   # 빌드 후 실행
 
 ## 인라인 리뷰 코멘트
 
-리뷰는 PR 전체에 대한 코멘트 하나가 아니라, Ollama가 `{summary, comments: [{file, line, body}]}` 형태의 JSON으로 응답하면 실제 diff의 해당 줄에 인라인 코멘트로 등록됩니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
+리뷰는 PR 전체에 대한 코멘트 하나가 아니라, LLM이 `{summary, comments: [{file, line, body}]}` 형태의 JSON으로 응답하면 실제 diff의 해당 줄에 인라인 코멘트로 등록됩니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
 
 ## Java→Kotlin 마이그레이션 리뷰
 

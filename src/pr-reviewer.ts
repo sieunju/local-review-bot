@@ -223,6 +223,8 @@ interface ParsedReview {
   comments: InlineComment[];
 }
 
+const LINE_NUMBER_INSTRUCTIONS = `"line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Calculate it from the hunk header "@@ -oldStart,oldCount +newStart,newCount @@": newStart + L, where L is the number of lines (added AND unchanged context lines, but NOT removed "-" lines) counted from the first line after that header down to the line you want to comment on (the first line after the header is L=0). Recompute newStart from each new "@@" header you cross. Omit comments you are not confident about the line number for.`;
+
 const REVIEW_JSON_INSTRUCTIONS = `
 Respond with ONLY valid JSON (no markdown fences, no extra text) in this exact shape:
 {
@@ -231,9 +233,41 @@ Respond with ONLY valid JSON (no markdown fences, no extra text) in this exact s
     { "file": "path/to/File.kt", "line": 42, "body": "review comment for this line" }
   ]
 }
-"line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Calculate it from the hunk header "@@ -oldStart,oldCount +newStart,newCount @@": newStart + L, where L is the number of lines (added AND unchanged context lines, but NOT removed "-" lines) counted from the first line after that header down to the line you want to comment on (the first line after the header is L=0). Recompute newStart from each new "@@" header you cross. Omit comments you are not confident about the line number for.
+${LINE_NUMBER_INSTRUCTIONS}
 IMPORTANT: write "summary" and every comment "body" in ${REVIEW_LANGUAGE_NAME}, regardless of what language the guide or diff above is in.
 `;
+
+// For guides that define their own {"findings":[...]} output schema
+// (e.g. CLAUDE_ANDROID.md): keep the guide's shape, only add line/language rules.
+const FINDINGS_JSON_INSTRUCTIONS = `
+Respond with ONLY valid JSON (no markdown fences, no extra text) in the {"findings":[...]} shape defined in the guide above.
+${LINE_NUMBER_INSTRUCTIONS}
+IMPORTANT: write "reasoning", "issue" and "fix" in ${REVIEW_LANGUAGE_NAME}, regardless of what language the guide or diff above is in.
+`;
+
+const MIN_FINDING_CONFIDENCE = 0.8;
+
+interface Finding {
+  file: string;
+  line: number;
+  severity?: string;
+  issue: string;
+  fix?: string;
+  confidence?: number;
+}
+
+function findingsToReview(findings: Finding[]): ParsedReview {
+  const kept = findings.filter((f) => (f.confidence ?? 1) >= MIN_FINDING_CONFIDENCE);
+  const count = (severity: string) => kept.filter((f) => f.severity === severity).length;
+  return {
+    summary: `MUST ${count("MUST")} · SHOULD ${count("SHOULD")}`,
+    comments: kept.map((f) => ({
+      path: f.file,
+      line: f.line,
+      body: `**[${f.severity ?? "SHOULD"}]** ${f.issue}` + (f.fix ? `\n\n**Fix:** ${f.fix}` : ""),
+    })),
+  };
+}
 
 function parseReview(raw: string): ParsedReview {
   const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
@@ -241,7 +275,11 @@ function parseReview(raw: string): ParsedReview {
     const parsed = JSON.parse(jsonText) as {
       summary?: string;
       comments?: Array<{ file: string; line: number; body: string }>;
+      findings?: Finding[];
     };
+    if (Array.isArray(parsed.findings)) {
+      return findingsToReview(parsed.findings);
+    }
     return {
       summary: parsed.summary ?? "",
       comments: (parsed.comments ?? []).map((c) => ({
@@ -266,8 +304,12 @@ async function generateReview(diff: string, stack: string, callerContext: string
   if (migrationGuide) {
     systemParts.push(migrationGuide);
   }
-  systemParts.push(`Write the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.`);
-  systemParts.push(REVIEW_JSON_INSTRUCTIONS);
+  if (guide.includes('"findings"')) {
+    systemParts.push(FINDINGS_JSON_INSTRUCTIONS);
+  } else {
+    systemParts.push(`Write the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.`);
+    systemParts.push(REVIEW_JSON_INSTRUCTIONS);
+  }
 
   const userContent = callerContext
     ? `${callerContext}\n\n=== DIFF (리뷰 대상 — 코멘트는 이 안의 파일/라인에만 달 수 있음) ===\n${diff}`

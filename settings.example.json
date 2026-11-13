@@ -1,0 +1,17 @@
+{
+  "llm": {
+    "apiUrl": "http://localhost:1234/v1",
+    "apiKey": "<api key>",
+    "model": "qwen2.5-coder:14b",
+    "temperature": 0.2,
+    "timeoutMs": 1200000
+  },
+  "reviewHours": {
+    "start": "09:00",
+    "end": "18:00"
+  },
+  "trigger": {
+    "mode": "auto",
+    "command": "@review-bot"
+  }
+}

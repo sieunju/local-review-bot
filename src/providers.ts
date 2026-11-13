@@ -15,6 +15,12 @@ export interface PostedComment {
   line: number;
 }
 
+export interface PrComment {
+  id: number;
+  body: string;
+  createdAt: string;
+}
+
 export interface DiffRefs {
   headSha: string;
   baseSha?: string;
@@ -25,6 +31,8 @@ export interface GitProvider {
   fetchOpenPullRequests(): Promise<PullRequest[]>;
   fetchDiff(prNumber: number): Promise<string>;
   fetchDiffRefs(prNumber: number): Promise<DiffRefs>;
+  // General (non-inline) PR comments, used to detect manual trigger commands.
+  fetchComments(prNumber: number): Promise<PrComment[]>;
   postReview(
     prNumber: number,
     refs: DiffRefs,
@@ -90,6 +98,14 @@ class GiteaProvider implements GitProvider {
     return { headSha: data.head.sha };
   }
 
+  async fetchComments(prNumber: number): Promise<PrComment[]> {
+    const res = await this.request(
+      `/repos/${this.config.owner}/${this.config.repo}/issues/${prNumber}/comments`
+    );
+    const data: Array<{ id: number; body: string; created_at: string }> = await res.json();
+    return data.map((c) => ({ id: c.id, body: c.body ?? "", createdAt: c.created_at }));
+  }
+
   async postReview(
     prNumber: number,
     refs: DiffRefs,
@@ -107,7 +123,10 @@ class GiteaProvider implements GitProvider {
           body: summary,
           comments: comments.map((c) => ({
             path: c.path,
+            // Gitea positions are real file line numbers; an added line
+            // has only a new-file position.
             new_position: c.line,
+            old_position: 0,
             body: c.body,
           })),
         }),
@@ -173,6 +192,20 @@ class GithubProvider implements GitProvider {
     );
     const data: { head: { sha: string } } = await res.json();
     return { headSha: data.head.sha };
+  }
+
+  async fetchComments(prNumber: number): Promise<PrComment[]> {
+    const all: PrComment[] = [];
+    for (let page = 1; ; page++) {
+      const res = await this.request(
+        `/repos/${this.config.owner}/${this.config.repo}/issues/${prNumber}/comments?per_page=100&page=${page}`
+      );
+      const data: Array<{ id: number; body: string; created_at: string }> = await res.json();
+      all.push(...data.map((c) => ({ id: c.id, body: c.body ?? "", createdAt: c.created_at })));
+      if (data.length < 100) {
+        return all;
+      }
+    }
   }
 
   async postReview(
@@ -254,6 +287,20 @@ class GitlabProvider implements GitProvider {
       baseSha: data.diff_refs.base_sha,
       startSha: data.diff_refs.start_sha,
     };
+  }
+
+  async fetchComments(prNumber: number): Promise<PrComment[]> {
+    const all: PrComment[] = [];
+    for (let page = 1; ; page++) {
+      const res = await this.request(
+        `/projects/${this.projectId}/merge_requests/${prNumber}/notes?per_page=100&page=${page}`
+      );
+      const data: Array<{ id: number; body: string; created_at: string }> = await res.json();
+      all.push(...data.map((c) => ({ id: c.id, body: c.body ?? "", createdAt: c.created_at })));
+      if (data.length < 100) {
+        return all;
+      }
+    }
   }
 
   async postReview(

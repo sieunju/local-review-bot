@@ -1,6 +1,6 @@
 # local-review-bot
 
-Gitea/GitHub/GitLab의 오픈 PR 중 Android(`.kt`, `.java`, `gradle`) / iOS(`.swift`, `.m`, `Podfile`) / Web(`.ts`, `.tsx`, `.js`, `.vue` 등) 관련 변경을 감지해 로컬 Ollama 모델로 자동 리뷰 댓글을 다는 봇. 저장소마다 스택을 다르게 지정할 수 있습니다.
+Gitea/GitHub/GitLab의 오픈 PR 중 Android(`.kt`, `.java`, `gradle`) / iOS(`.swift`, `.m`, `Podfile`) / Web(`.ts`, `.tsx`, `.js`, `.vue` 등) 관련 변경을 감지해 로컬 LLM(OpenAI 호환 API)으로 자동 리뷰 댓글을 다는 봇. 저장소마다 스택을 다르게 지정할 수 있습니다.
 
 ## 왜 폴링 방식인가
 
@@ -12,16 +12,17 @@ Gitea/GitHub/GitLab의 오픈 PR 중 Android(`.kt`, `.java`, `gradle`) / iOS(`.s
 
 ## 준비물
 
-- [Ollama](https://ollama.com) 설치 후 리뷰용 모델 pull (예: `ollama pull qwen2.5-coder:14b`)
+- OpenAI 호환 API(`/chat/completions`)를 제공하는 로컬 LLM 서버의 주소와 API Key
 - Git 호스팅 서버(Gitea/GitHub/GitLab)의 API 토큰
 
 ## 설정
 
 ```bash
 cp .env.example .env
+cp settings.example.json settings.json
 ```
 
-`.env`를 실제 값으로 채웁니다.
+`.env`와 `settings.json`을 실제 값으로 채웁니다. 저장소/폴링 설정은 `.env`, LLM 접속 정보와 리뷰 시간대는 `settings.json`에 둡니다.
 
 | 변수                       | 설명                                                                                                |
 | -------------------------- | --------------------------------------------------------------------------------------------------- |
@@ -31,15 +32,39 @@ cp .env.example .env
 | `REPO_OWNER` / `REPO_NAME` | 저장소 소유자/이름                                                                                  |
 | `STACK`                    | 리뷰 페르소나. `android` \| `ios` \| `web`, 기본 `android` (저장소 1개만 볼 때)                     |
 | `REPOS`                    | 여러 저장소를 볼 때 쓰는 JSON 배열. 설정하면 위 5개는 무시됨 (아래 [여러 프로젝트 보기](#여러-프로젝트-보기) 참고) |
-| `OLLAMA_URL`               | 기본 `http://localhost:11434`                                                                       |
-| `OLLAMA_MODEL`             | 로컬에 pull 받은 모델명                                                                             |
-| `OLLAMA_NUM_CTX`           | Ollama 컨텍스트 윈도우 크기(토큰), 기본 16384. 생략하면 Ollama 기본값(4096)이 적용돼 가이드+diff가 길 때 프롬프트가 잘릴 수 있음 |
-| `OLLAMA_TEMPERATURE`       | Ollama 생성 temperature, 기본 0.2                                                                   |
-| `OLLAMA_TIMEOUT_MS`         | Ollama 요청 fetch 타임아웃(ms), 기본 1200000(20분). `num_ctx`가 크거나 로컬 모델이 느리면 Node 기본 타임아웃(5분)에 걸려 `HeadersTimeoutError`가 날 수 있어 넉넉히 잡음 |
 | `REVIEW_INTERVAL`          | 폴링 주기(초), 기본 300                                                                             |
 | `REVIEW_LANGUAGE`          | 리뷰 코멘트 작성 언어 (예: `ko`, `en`), 기본 `ko`                                                    |
 | `REPO_PATHS`                | Java→Kotlin 마이그레이션 리뷰용 `{"owner/repo": "로컬 클론 경로"}` JSON, 기본 `{}` (아래 [마이그레이션 리뷰](#javakotlin-마이그레이션-리뷰) 참고) |
 | `BASE_REF`                  | 위 기능에서 `DiffRefs`에 base sha가 없을 때 쓰는 폴백 base ref, 기본 `origin/develop`               |
+
+### settings.json
+
+```json
+{
+  "llm": {
+    "apiUrl": "http://localhost:1234/v1",
+    "apiKey": "<api key>",
+    "model": "qwen2.5-coder:14b",
+    "temperature": 0.2,
+    "timeoutMs": 1200000
+  },
+  "reviewHours": { "start": "09:00", "end": "18:00" },
+  "trigger": { "mode": "auto", "command": "@review-bot" }
+}
+```
+
+| 키                  | 설명                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
+| `llm.apiUrl`        | (필수) OpenAI 호환 API의 base URL. 여기에 `/chat/completions`를 붙여 호출                          |
+| `llm.apiKey`        | API Key. 있으면 `Authorization: Bearer <key>` 헤더로 전송, 생략 가능                               |
+| `llm.model`         | (필수) 사용할 모델명                                                                              |
+| `llm.temperature`   | 생성 temperature, 기본 0.2                                                                        |
+| `llm.timeoutMs`     | LLM 요청 fetch 타임아웃(ms), 기본 1200000(20분). 프롬프트가 크거나 모델이 느리면 Node 기본 타임아웃(5분)에 걸려 `HeadersTimeoutError`가 날 수 있어 넉넉히 잡음 |
+| `reviewHours`       | 폴링 실행 시 리뷰를 도는 시간대 (로컬 시간, `HH:MM`). `start` 이상 `end` 미만일 때만 리뷰하고 그 외에는 건너뜀. `start`가 `end`보다 늦으면 자정을 넘기는 시간대(예: `22:00`~`06:00`)로 처리. 생략하면 24시간 동작. `npm run review:once`는 시간대와 무관하게 실행 |
+| `trigger.mode`      | `auto`(기본): 오픈 PR을 전부 리뷰. `manual`: PR에 명령어 코멘트가 달렸을 때만 리뷰 (아래 [리뷰 방식](#리뷰-방식-자동--수동) 참고) |
+| `trigger.command`   | 수동 모드에서 쓰는 명령어, 기본 `@review-bot`                                                     |
+
+`settings.json`은 API Key가 들어가므로 `.gitignore`에 등록되어 있습니다.
 
 ### 여러 프로젝트 보기
 
@@ -59,10 +84,30 @@ REPOS=[
 
 ```bash
 npm install
-npm run review:once   # 단발 실행
+cp .env.example .env                      # 저장소/토큰/폴링 주기
+cp settings.example.json settings.json    # LLM API 주소·API Key, 리뷰 시간대, 리뷰 방식
+npm run review:once   # 단발 실행 (리뷰 시간대 무시)
 npm run dev            # 폴링 실행 (REVIEW_INTERVAL마다 반복)
 npm run build && npm start   # 빌드 후 실행
 ```
+
+## 리뷰 방식 (자동 / 수동)
+
+`settings.json`의 `trigger.mode`로 고릅니다.
+
+- **자동 (`auto`, 기본)**: 폴링할 때마다 오픈 PR을 전부 확인하고, 아직 리뷰하지 않았거나 새 커밋이 올라온 PR을 리뷰합니다.
+- **수동 (`manual`)**: PR에 `@review-bot` 코멘트를 달았을 때만 그 PR을 리뷰합니다.
+
+수동 모드 사용법:
+
+1. `settings.json`에 `"trigger": { "mode": "manual" }`을 넣고 `npm run dev`로 봇을 띄웁니다.
+2. 리뷰받고 싶은 PR에 일반 코멘트로 `@review-bot`을 답니다. 코멘트 **첫 줄의 첫 단어**가 명령어여야 인식합니다 (`@review-bot 부탁해요`는 되고, `리뷰 좀 @review-bot`은 안 됨).
+3. 다음 폴링(`REVIEW_INTERVAL`초 이내, 리뷰 시간대 안일 때)에 봇이 명령을 감지하고 리뷰를 답니다.
+
+- 같은 커밋이라도 명령을 다시 달면 다시 리뷰합니다.
+- 봇을 수동 모드로 처음 띄운 시각 이전에 달린 코멘트는 무시합니다.
+- 한 번 처리한 명령은 봇을 재시작해도 다시 실행하지 않습니다. `npm run db:reset`을 하면 이 기록도 초기화됩니다.
+- 명령어는 `trigger.command`로 바꿀 수 있습니다.
 
 `npm run dev`는 포그라운드에서 `REVIEW_INTERVAL`마다 계속 폴링하는 프로세스입니다. 종료하려면:
 
@@ -87,7 +132,35 @@ npm run build && npm start   # 빌드 후 실행
 
 ## 인라인 리뷰 코멘트
 
-리뷰는 PR 전체에 대한 코멘트 하나가 아니라, Ollama가 `{summary, comments: [{file, line, body}]}` 형태의 JSON으로 응답하면 실제 diff의 해당 줄에 인라인 코멘트로 등록됩니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
+리뷰는 PR 전체에 대한 코멘트 하나가 아니라, LLM이 JSON으로 응답한 지적 사항을 실제 diff의 해당 줄에 인라인 코멘트로 등록합니다 (Gitea/GitHub는 PR review API, GitLab은 discussions API 사용). 응답 형식은 `{summary, comments: [{file, line, code, body}]}`이고, 가이드 파일이 자체 `{"findings": [...]}` 형식을 정의하면(예: [CLAUDE_ANDROID.md](CLAUDE_ANDROID.md)) 그 형식을 씁니다. 모델이 JSON이 아닌 응답을 주면 자동으로 summary만 남기고 일반 리뷰 코멘트로 대체됩니다.
+
+### 코드 스니펫 표시
+
+각 코멘트는 문제가 되는 코드를 먼저 보여주고 그 아래에 설명을 답니다:
+
+````markdown
+```kotlin
+GlobalScope.launch {
+    repo.load(x)
+}
+```
+`app/Foo.kt:13-15`
+
+**[MUST]** GlobalScope 사용 ...
+````
+
+- 모델에게 문제 코드 2~6줄을 diff에서 그대로 복사해 `code`로 달라고 시키고, 봇이 그 코드를 diff에서 찾아 **diff 원문**으로 스니펫을 만듭니다 (최대 6줄, 1줄이면 위아래 1줄씩 문맥 추가).
+- 코드 블록 언어는 파일 확장자로 정합니다 (`.kt` → `kotlin`, `.java` → `java` 등).
+
+### 줄 번호 정확도
+
+로컬 모델은 hunk 헤더(`@@ -a,b +c,d @@`)로 줄 번호를 계산하다 자주 틀리므로, 모델이 계산하지 않게 하고 응답도 검증합니다 ([src/diff-lines.ts](src/diff-lines.ts)).
+
+1. **번호 붙은 diff 전송**: 모델에게 보내는 diff의 모든 줄 앞에 새 파일 줄 번호를 붙입니다. 추가 줄은 `L42 + code`, 컨텍스트 줄은 `L42   code`, 삭제 줄은 번호 없이 `     - code`. 모델은 번호를 읽어서 그대로 적기만 합니다.
+2. **응답 검증**: 모델이 준 `line`이 추가된 줄이고 그 줄이 `code`와 일치하면 그대로 씁니다. 아니면 `code`와 일치하는 추가 줄을 찾아 그 번호로 교정합니다 (같은 코드가 여러 곳이면 원래 `line`에 가장 가까운 곳).
+3. **강등**: `code`가 어떤 추가 줄과도 맞지 않으면 인라인으로 달지 않고 PR 요약 코멘트 아래로 내립니다.
+
+교정과 강등은 로그에 남습니다 (`🔧 줄 번호 교정 3 → 13`, `⚠️ 인라인 불가 → 요약으로 이동`). 단위 테스트는 `npm test`로 실행합니다.
 
 ## Java→Kotlin 마이그레이션 리뷰
 

@@ -6,16 +6,57 @@ import Database from "better-sqlite3";
 import { Agent, setGlobalDispatcher } from "undici";
 import { createGitProvider, DiffRefs, GitProvider, InlineComment, PostedComment, ProjectConfig } from "./providers";
 import { buildCallerContext, detectJavaToKotlinMigrations } from "./migration-context";
+import { annotateDiff, normalizeCode, quotedLines, resolveLine, splitDiffByFile } from "./diff-lines";
+
+interface Settings {
+  llm: {
+    // OpenAI-compatible base URL, e.g. "http://localhost:1234/v1"
+    apiUrl: string;
+    apiKey?: string;
+    model: string;
+    temperature?: number;
+    timeoutMs?: number;
+  };
+  // Local-time window in which the polling loop reviews PRs, "HH:MM" each.
+  // Omit to review around the clock. start > end means an overnight window.
+  reviewHours?: { start: string; end: string };
+  trigger?: {
+    // "auto" (default): review every open PR. "manual": review a PR only
+    // when someone comments the command on it.
+    mode?: "auto" | "manual";
+    // First word of the comment's first line, default "@review-bot".
+    command?: string;
+  };
+}
+
+function loadSettings(): Settings {
+  const settingsPath = path.join(process.cwd(), "settings.json");
+  if (!fs.existsSync(settingsPath)) {
+    throw new Error("settings.json이 없습니다. settings.example.json을 복사해서 만들어 주세요.");
+  }
+  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8")) as Settings;
+  if (!settings.llm?.apiUrl || !settings.llm?.model) {
+    throw new Error("settings.json의 llm.apiUrl, llm.model은 필수입니다.");
+  }
+  return settings;
+}
+
+const settings = loadSettings();
+const TRIGGER_MODE = settings.trigger?.mode ?? "auto";
+const TRIGGER_COMMAND = settings.trigger?.command ?? "@review-bot";
+if (TRIGGER_MODE !== "auto" && TRIGGER_MODE !== "manual") {
+  throw new Error(`settings.json trigger.mode 값이 잘못됐습니다: "${TRIGGER_MODE}" (auto | manual)`);
+}
 
 // Node's built-in fetch is undici under the hood, and defaults to a 300s
-// headersTimeout/bodyTimeout. generateReview() calls Ollama with
+// headersTimeout/bodyTimeout. generateReview() calls the LLM with
 // stream:false, so it sends nothing — not even response headers — until
-// generation is fully done. A large num_ctx (migration caller context can
+// generation is fully done. A large prompt (migration caller context can
 // add tens of thousands of chars) or a slow local model can push that past
-// 5 minutes, tripping undici's HeadersTimeoutError before Ollama ever gets
+// 5 minutes, tripping undici's HeadersTimeoutError before the LLM ever gets
 // to respond.
-const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS ?? 20 * 60_000);
-setGlobalDispatcher(new Agent({ headersTimeout: OLLAMA_TIMEOUT_MS, bodyTimeout: OLLAMA_TIMEOUT_MS }));
+const LLM_TIMEOUT_MS = settings.llm.timeoutMs ?? 20 * 60_000;
+setGlobalDispatcher(new Agent({ headersTimeout: LLM_TIMEOUT_MS, bodyTimeout: LLM_TIMEOUT_MS }));
 
 const DEFAULT_URLS: Record<string, string> = {
   gitea: "http://localhost:3000",
@@ -58,10 +99,8 @@ const STACK_LABELS: Record<string, string> = {
   web: "Web frontend",
 };
 
-const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434";
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL ?? "qwen2.5-coder:7b";
-const OLLAMA_NUM_CTX = Number(process.env.OLLAMA_NUM_CTX ?? 16384);
-const OLLAMA_TEMPERATURE = Number(process.env.OLLAMA_TEMPERATURE ?? 0.2);
+const LLM_API_URL = settings.llm.apiUrl.replace(/\/+$/, "");
+const LLM_TEMPERATURE = settings.llm.temperature ?? 0.2;
 const REVIEW_INTERVAL = Number(process.env.REVIEW_INTERVAL ?? 300);
 const REVIEW_LANGUAGE = process.env.REVIEW_LANGUAGE ?? "ko";
 const REVIEW_LANGUAGE_NAMES: Record<string, string> = { ko: "Korean (한국어)", en: "English", ja: "Japanese (日本語)" };
@@ -73,6 +112,27 @@ const REPO_PATHS: Record<string, string> = process.env.REPO_PATHS
   ? JSON.parse(process.env.REPO_PATHS)
   : {};
 const FALLBACK_BASE_REF = process.env.BASE_REF ?? "origin/develop";
+
+function parseClock(value: string): number {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value);
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
+    throw new Error(`settings.json reviewHours 값이 잘못됐습니다: "${value}" (HH:MM 형식)`);
+  }
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+const REVIEW_HOURS = settings.reviewHours
+  ? { start: parseClock(settings.reviewHours.start), end: parseClock(settings.reviewHours.end) }
+  : undefined;
+
+function isWithinReviewHours(now: Date): boolean {
+  if (!REVIEW_HOURS) {
+    return true;
+  }
+  const minutes = now.getHours() * 60 + now.getMinutes();
+  const { start, end } = REVIEW_HOURS;
+  return start <= end ? minutes >= start && minutes < end : minutes >= start || minutes < end;
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -129,6 +189,55 @@ db.exec(`
     PRIMARY KEY (project, comment_id)
   )
 `);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pr_triggers (
+    project TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    last_comment_id INTEGER NOT NULL,
+    PRIMARY KEY (project, pr_number)
+  )
+`);
+db.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+
+// Manual mode only reacts to commands commented after the bot was first
+// started in manual mode, so old comments on existing PRs don't fire.
+function getManualStartedAt(): number {
+  const row = db.prepare("SELECT value FROM meta WHERE key = 'manual_started_at'").get() as
+    | { value: string }
+    | undefined;
+  if (row) {
+    return Date.parse(row.value);
+  }
+  const now = new Date();
+  db.prepare("INSERT INTO meta (key, value) VALUES ('manual_started_at', ?)").run(now.toISOString());
+  return now.getTime();
+}
+const MANUAL_STARTED_AT = TRIGGER_MODE === "manual" ? getManualStartedAt() : 0;
+
+function isTriggerCommand(body: string): boolean {
+  const firstLine = body.trim().split("\n")[0] ?? "";
+  return firstLine.trim().split(/\s+/)[0] === TRIGGER_COMMAND;
+}
+
+// Returns true if a new, not-yet-handled command comment exists on the PR.
+// The high-water mark is saved before the review runs, so a crash mid-review
+// doesn't re-run the same command on restart.
+async function consumeTrigger(project: Project, prNumber: number): Promise<boolean> {
+  const row = db
+    .prepare("SELECT last_comment_id FROM pr_triggers WHERE project = ? AND pr_number = ?")
+    .get(project.label, prNumber) as { last_comment_id: number } | undefined;
+  const lastSeen = row?.last_comment_id ?? 0;
+  const fresh = (await project.provider.fetchComments(prNumber)).filter(
+    (c) => c.id > lastSeen && Date.parse(c.createdAt) >= MANUAL_STARTED_AT
+  );
+  if (fresh.length === 0) {
+    return false;
+  }
+  db.prepare(
+    "INSERT OR REPLACE INTO pr_triggers (project, pr_number, last_comment_id) VALUES (?, ?, ?)"
+  ).run(project.label, prNumber, Math.max(...fresh.map((c) => c.id)));
+  return fresh.some((c) => isTriggerCommand(c.body));
+}
 
 const projects: Project[] = loadProjects().map((cfg) => {
   const provider = cfg.provider.toLowerCase();
@@ -223,36 +332,164 @@ interface ParsedReview {
   comments: InlineComment[];
 }
 
+// A comment as parsed from the LLM, before the code snippet is attached.
+interface DraftComment extends InlineComment {
+  code?: string;
+}
+
+const CODE_INSTRUCTIONS = `Every item must also include "code": the 2-6 consecutive lines of the problematic code, copied character-for-character from the diff's added lines (without the "L<number> +" prefix), with "\\n" between lines. It must contain the line that "line" points to. Do not paraphrase, reformat or shorten the code.`;
+
+const LINE_NUMBER_INSTRUCTIONS = `Each line is prefixed with its new-file line number (e.g. \`L42 + code\`). Copy the line number from the prefix. Never compute or guess it. Added lines look like \`L42 + code\`, unchanged context lines like \`L42   code\`, and removed lines have no number. "line" must be the number from the prefix of an added line.`;
+
 const REVIEW_JSON_INSTRUCTIONS = `
 Respond with ONLY valid JSON (no markdown fences, no extra text) in this exact shape:
 {
   "summary": "one-line overall summary",
   "comments": [
-    { "file": "path/to/File.kt", "line": 42, "body": "review comment for this line" }
+    { "file": "path/to/File.kt", "line": 42, "code": "val user = repo.find(id)!!\\nshow(user.name)", "body": "review comment for this line" }
   ]
 }
-"line" must be the line number in the NEW version of the file (as shown in the diff's + lines). Calculate it from the hunk header "@@ -oldStart,oldCount +newStart,newCount @@": newStart + L, where L is the number of lines (added AND unchanged context lines, but NOT removed "-" lines) counted from the first line after that header down to the line you want to comment on (the first line after the header is L=0). Recompute newStart from each new "@@" header you cross. Omit comments you are not confident about the line number for.
+${LINE_NUMBER_INSTRUCTIONS}
+${CODE_INSTRUCTIONS}
 IMPORTANT: write "summary" and every comment "body" in ${REVIEW_LANGUAGE_NAME}, regardless of what language the guide or diff above is in.
 `;
 
-function parseReview(raw: string): ParsedReview {
+// For guides that define their own {"findings":[...]} output schema
+// (e.g. CLAUDE_ANDROID.md): keep the guide's shape, only add line/language rules.
+const FINDINGS_JSON_INSTRUCTIONS = `
+Respond with ONLY valid JSON (no markdown fences, no extra text) in the {"findings":[...]} shape defined in the guide above.
+${LINE_NUMBER_INSTRUCTIONS}
+${CODE_INSTRUCTIONS}
+IMPORTANT: write "reasoning", "issue" and "fix" in ${REVIEW_LANGUAGE_NAME}, regardless of what language the guide or diff above is in.
+`;
+
+const MIN_FINDING_CONFIDENCE = 0.8;
+
+interface Finding {
+  file: string;
+  line: number;
+  code?: string;
+  severity?: string;
+  issue: string;
+  fix?: string;
+  confidence?: number;
+}
+
+function findingsToReview(findings: Finding[]): { summary: string; comments: DraftComment[] } {
+  const kept = findings.filter((f) => (f.confidence ?? 1) >= MIN_FINDING_CONFIDENCE);
+  const count = (severity: string) => kept.filter((f) => f.severity === severity).length;
+  return {
+    summary: `MUST ${count("MUST")} · SHOULD ${count("SHOULD")}`,
+    comments: kept.map((f) => ({
+      path: f.file,
+      line: f.line,
+      code: f.code,
+      body: `**[${f.severity ?? "SHOULD"}]** ${f.issue}` + (f.fix ? `\n\n**Fix:** ${f.fix}` : ""),
+    })),
+  };
+}
+
+function parseReview(raw: string): { summary: string; comments: DraftComment[] } {
   const jsonText = raw.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "");
   try {
     const parsed = JSON.parse(jsonText) as {
       summary?: string;
-      comments?: Array<{ file: string; line: number; body: string }>;
+      comments?: Array<{ file: string; line: number; code?: string; body: string }>;
+      findings?: Finding[];
     };
+    if (Array.isArray(parsed.findings)) {
+      return findingsToReview(parsed.findings);
+    }
     return {
       summary: parsed.summary ?? "",
       comments: (parsed.comments ?? []).map((c) => ({
         path: c.file,
         line: c.line,
+        code: c.code,
         body: c.body,
       })),
     };
   } catch {
     return { summary: raw, comments: [] };
   }
+}
+
+const SNIPPET_MAX_LINES = 6;
+
+const FENCE_LANGUAGES: Record<string, string> = {
+  kt: "kotlin",
+  kts: "kotlin",
+  java: "java",
+  xml: "xml",
+  gradle: "groovy",
+  swift: "swift",
+  m: "objectivec",
+  h: "objectivec",
+  ts: "typescript",
+  tsx: "tsx",
+  js: "javascript",
+  jsx: "jsx",
+  vue: "vue",
+};
+
+// Picks the [start, end] new-file line range to show for a comment anchored
+// at `line`: the quoted block around it (up to SNIPPET_MAX_LINES), limited to
+// lines that are contiguous in the diff.
+function snippetRange(lines: Map<number, string>, line: number, code: string | undefined): [number, number] {
+  const quoted = quotedLines(code);
+  const offset = Math.max(0, quoted.indexOf(normalizeCode(lines.get(line) ?? "")));
+  let start = line - Math.min(offset, SNIPPET_MAX_LINES - 1);
+  let end = start + Math.min(Math.max(quoted.length, 1), SNIPPET_MAX_LINES) - 1;
+  // A single line alone is hard to place — show one line of context each side.
+  if (start === end) {
+    start--;
+    end++;
+  }
+  let from = line;
+  let to = line;
+  while (from > start && lines.has(from - 1)) from--;
+  while (to < end && lines.has(to + 1)) to++;
+  return [from, to];
+}
+
+// Verifies each comment's line against the code the LLM quoted (correcting
+// it when the code is found elsewhere), prefixes the body with a fenced
+// snippet taken from the diff itself, and moves comments that can't be
+// placed on an added line into the summary.
+function attachSnippets(review: { summary: string; comments: DraftComment[] }, diff: string): ParsedReview {
+  const patches = splitDiffByFile(diff);
+  const comments: InlineComment[] = [];
+  let summary = review.summary;
+  for (const { code, ...comment } of review.comments) {
+    const patch = patches.get(comment.path);
+    const file = patch === undefined ? undefined : annotateDiff(patch);
+    const line = file && resolveLine({ line: comment.line, code }, file.added);
+    if (!file || line === undefined) {
+      const reason = !file ? "diff에 없는 파일" : "code가 추가된 줄과 일치하지 않음";
+      console.warn(`⚠️  ${comment.path}:${comment.line} 인라인 불가 → 요약으로 이동 (${reason})`);
+      summary += `\n\n---\n\`${comment.path}\`\n\n${comment.body}`;
+      continue;
+    }
+    if (line !== comment.line) {
+      console.log(`🔧 ${comment.path}: 줄 번호 교정 ${comment.line} → ${line} (code 일치 위치 기준)`);
+    }
+    const [start, end] = snippetRange(file.lines, line, code);
+    const snippet: string[] = [];
+    for (let n = start; n <= end; n++) {
+      snippet.push(file.lines.get(n)!);
+    }
+    const indent = Math.min(...snippet.filter((l) => l.trim()).map((l) => l.length - l.trimStart().length));
+    const location = start === end ? `${start}` : `${start}-${end}`;
+    const language = FENCE_LANGUAGES[comment.path.split(".").pop() ?? ""] ?? "";
+    comments.push({
+      ...comment,
+      line,
+      body:
+        `\`\`\`${language}\n${snippet.map((l) => l.slice(indent)).join("\n")}\n\`\`\`\n` +
+        `\`${comment.path}:${location}\`\n\n${comment.body}`,
+    });
+  }
+  return { summary, comments };
 }
 
 async function generateReview(diff: string, stack: string, callerContext: string): Promise<ParsedReview> {
@@ -266,20 +503,29 @@ async function generateReview(diff: string, stack: string, callerContext: string
   if (migrationGuide) {
     systemParts.push(migrationGuide);
   }
-  systemParts.push(`Write the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.`);
-  systemParts.push(REVIEW_JSON_INSTRUCTIONS);
+  if (guide.includes('"findings"')) {
+    systemParts.push(FINDINGS_JSON_INSTRUCTIONS);
+  } else {
+    systemParts.push(`Write the "summary" and all comment "body" text in ${REVIEW_LANGUAGE_NAME}.`);
+    systemParts.push(REVIEW_JSON_INSTRUCTIONS);
+  }
 
+  // The LLM sees every line prefixed with its new-file line number.
+  const numberedDiff = [...splitDiffByFile(diff).values()].map((patch) => annotateDiff(patch).text).join("\n");
   const userContent = callerContext
-    ? `${callerContext}\n\n=== DIFF (리뷰 대상 — 코멘트는 이 안의 파일/라인에만 달 수 있음) ===\n${diff}`
-    : `Review the following diff and leave concise, actionable feedback:\n\n${diff}`;
+    ? `${callerContext}\n\n=== DIFF (리뷰 대상 — 코멘트는 이 안의 파일/라인에만 달 수 있음) ===\n${numberedDiff}`
+    : `Review the following diff and leave concise, actionable feedback:\n\n${numberedDiff}`;
 
-  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+  const res = await fetch(`${LLM_API_URL}/chat/completions`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(settings.llm.apiKey ? { Authorization: `Bearer ${settings.llm.apiKey}` } : {}),
+    },
     body: JSON.stringify({
-      model: OLLAMA_MODEL,
+      model: settings.llm.model,
       stream: false,
-      options: { num_ctx: OLLAMA_NUM_CTX, temperature: OLLAMA_TEMPERATURE },
+      temperature: LLM_TEMPERATURE,
       messages: [
         {
           role: "system",
@@ -293,17 +539,18 @@ async function generateReview(diff: string, stack: string, callerContext: string
     }),
   });
   if (!res.ok) {
-    throw new Error(`Ollama API error: ${res.status}`);
+    throw new Error(`LLM API error: ${res.status}`);
   }
-  const data = (await res.json()) as { message: { content: string }; prompt_eval_count?: number };
-  console.log(`🤖 Ollama 응답:\n${data.message.content}`);
-  if (typeof data.prompt_eval_count === "number") {
-    console.log(`📊 prompt tokens: ${data.prompt_eval_count} / num_ctx ${OLLAMA_NUM_CTX}`);
-    if (data.prompt_eval_count > OLLAMA_NUM_CTX * 0.9) {
-      console.warn(`⚠️  prompt tokens가 num_ctx(${OLLAMA_NUM_CTX})의 90%를 넘었습니다 — 프롬프트가 잘렸을 수 있습니다.`);
-    }
+  const data = (await res.json()) as {
+    choices: Array<{ message: { content: string } }>;
+    usage?: { prompt_tokens?: number };
+  };
+  const content = data.choices[0].message.content;
+  console.log(`🤖 LLM 응답:\n${content}`);
+  if (typeof data.usage?.prompt_tokens === "number") {
+    console.log(`📊 prompt tokens: ${data.usage.prompt_tokens}`);
   }
-  return parseReview(data.message.content);
+  return attachSnippets(parseReview(content), diff);
 }
 
 async function reviewProject(project: Project): Promise<void> {
@@ -312,8 +559,15 @@ async function reviewProject(project: Project): Promise<void> {
   console.log(`\n📋 [${new Date().toLocaleTimeString()}] [${label}] 오픈 PR 확인: ${prs.length}개`);
 
   for (const pr of prs) {
+    if (TRIGGER_MODE === "manual") {
+      if (!(await consumeTrigger(project, pr.number))) {
+        continue;
+      }
+      console.log(`💬 [${label}] PR #${pr.number}: ${TRIGGER_COMMAND} 명령 감지`);
+    }
     const refs = await provider.fetchDiffRefs(pr.number);
-    if (isAlreadyReviewed(label, pr.number, refs.headSha)) {
+    // A manual command always re-reviews, even if the head commit is unchanged.
+    if (TRIGGER_MODE === "auto" && isAlreadyReviewed(label, pr.number, refs.headSha)) {
       console.log(`⏭️  [${label}] PR #${pr.number}: 이미 리뷰됨 (변경 없음)`);
       continue;
     }
@@ -386,15 +640,34 @@ async function main(): Promise<void> {
   console.log("🚀 PR 리뷰 에이전트 시작");
   if (!once) {
     console.log(`⏰ 체크 간격: ${REVIEW_INTERVAL}초`);
+    console.log(
+      TRIGGER_MODE === "manual"
+        ? `🎯 수동 모드: PR에 "${TRIGGER_COMMAND}" 코멘트가 달리면 리뷰`
+        : "🎯 자동 모드: 오픈 PR 전부 리뷰"
+    );
+    if (settings.reviewHours) {
+      console.log(`🕘 리뷰 시간대: ${settings.reviewHours.start} ~ ${settings.reviewHours.end}`);
+    }
   }
 
-  await reviewOpenPullRequests();
-
-  if (!once) {
-    setInterval(() => {
-      reviewOpenPullRequests().catch((err) => console.error(err));
-    }, REVIEW_INTERVAL * 1000);
+  // --once is a manual run, so it ignores the review-hours window.
+  if (once) {
+    await reviewOpenPullRequests();
+    return;
   }
+
+  const tick = async (): Promise<void> => {
+    if (!isWithinReviewHours(new Date())) {
+      console.log(`💤 [${new Date().toLocaleTimeString()}] 리뷰 시간대가 아니라 건너뜀`);
+      return;
+    }
+    await reviewOpenPullRequests();
+  };
+
+  await tick();
+  setInterval(() => {
+    tick().catch((err) => console.error(err));
+  }, REVIEW_INTERVAL * 1000);
 }
 
 main().catch((err) => {
